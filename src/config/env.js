@@ -50,6 +50,12 @@ export const env = {
      */
     testPhone: optional('TEST_PHONE'),
     testOtp: optional('TEST_OTP'),
+    /**
+     * Group testing mode — when 'true' AND TEST_OTP is set, any valid Indian
+     * phone number accepts TEST_OTP. Each tester signs into their own account
+     * with their own real number. NEVER enable in production.
+     */
+    acceptAnyPhone: optional('TEST_ACCEPT_ANY_PHONE', 'false') === 'true',
   },
 
   twilio: {

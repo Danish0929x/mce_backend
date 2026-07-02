@@ -87,11 +87,11 @@ const twilioProvider = {
  * handing the app to a tester without paying for Twilio. Disabled by default.
  */
 function isTestPhone(phoneE164) {
-  return (
-    env.otp.testPhone &&
-    env.otp.testOtp &&
-    phoneE164 === env.otp.testPhone
-  );
+  if (!env.otp.testOtp) return false;
+  // Group-testing mode — any valid phone accepts the master OTP.
+  if (env.otp.acceptAnyPhone) return true;
+  // Single-phone reviewer bypass.
+  return env.otp.testPhone && phoneE164 === env.otp.testPhone;
 }
 
 // ---------- selector + helpers ----------
