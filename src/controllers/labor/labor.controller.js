@@ -420,15 +420,22 @@ export async function markPayrollPaid(req, res, next) {
     }
 
     // Compute and freeze.
-    const att = await Attendance.find({
-      workerId: worker._id,
-      workDate: { $gte: weekStart, $lte: weekEnd },
-    });
+    const [att, bonuses] = await Promise.all([
+      Attendance.find({
+        workerId: worker._id,
+        workDate: { $gte: weekStart, $lte: weekEnd },
+      }),
+      BonusPayment.find({
+        workerId: worker._id,
+        paidAt: { $gte: weekStart, $lte: weekEnd },
+      }),
+    ]);
     const r = await calculateWeeklyPayroll({
       worker,
       attendance: att,
       weekStart,
     });
+    const bonusPaise = bonuses.reduce((s, b) => s + b.amountPaise, 0);
 
     const doc = await PayrollWeek.findOneAndUpdate(
       { workerId: worker._id, weekStart },
@@ -442,8 +449,8 @@ export async function markPayrollPaid(req, res, next) {
           festivalDays: r.festivalDays ?? 0,
           totalHours: r.totalHours,
           basePayPaise: r.totalPaise,
-          bonusPaise: 0,
-          totalPaise: r.totalPaise,
+          bonusPaise,
+          totalPaise: r.totalPaise + bonusPaise,
           paidAt: new Date(),
           paidBy: req.user.sub,
           days: r.days,

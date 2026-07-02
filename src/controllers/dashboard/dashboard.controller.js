@@ -5,6 +5,67 @@ import { Worker } from '../../models/Worker.js';
 import { FertilizerSchedule } from '../../models/FertilizerSchedule.js';
 import { Fertilizer } from '../../models/Fertilizer.js';
 import { Inventory } from '../../models/Inventory.js';
+import { Attendance } from '../../models/Attendance.js';
+import { PayrollWeek } from '../../models/PayrollWeek.js';
+import { BonusPayment } from '../../models/BonusPayment.js';
+import { calculateWeeklyPayroll } from '../../services/wage-engine.service.js';
+
+function startOfWeekMonday(date) {
+  const d = new Date(date);
+  d.setUTCHours(0, 0, 0, 0);
+  const dow = d.getUTCDay();
+  const diff = (dow + 6) % 7;
+  d.setUTCDate(d.getUTCDate() - diff);
+  return d;
+}
+
+/**
+ * Sum of unpaid wages + bonuses across all active workers for the current
+ * week. Mirrors the Weekly Payroll screen's totals but only counts workers
+ * whose PayrollWeek row is missing or unpaid. Already-paid weeks contribute 0.
+ */
+async function computePayrollDuePaise(plantationId) {
+  const weekStart = startOfWeekMonday(new Date());
+  const weekEnd = new Date(weekStart);
+  weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
+  weekEnd.setUTCHours(23, 59, 59, 999);
+
+  const [workers, attendance, paidRows, bonuses] = await Promise.all([
+    Worker.find({ plantationId, active: true }),
+    Attendance.find({
+      plantationId,
+      workDate: { $gte: weekStart, $lte: weekEnd },
+    }),
+    PayrollWeek.find({ plantationId, weekStart }),
+    BonusPayment.find({
+      plantationId,
+      paidAt: { $gte: weekStart, $lte: weekEnd },
+    }),
+  ]);
+
+  const paidByWorker = new Map(
+    paidRows.map((r) => [r.workerId.toString(), r]),
+  );
+  const bonusByWorker = new Map();
+  for (const b of bonuses) {
+    const key = b.workerId.toString();
+    bonusByWorker.set(key, (bonusByWorker.get(key) ?? 0) + b.amountPaise);
+  }
+
+  let due = 0;
+  for (const w of workers) {
+    const wId = w._id.toString();
+    if (paidByWorker.get(wId)?.paidAt) continue; // already paid — nothing due
+    const att = attendance.filter((a) => a.workerId.toString() === wId);
+    const r = await calculateWeeklyPayroll({
+      worker: w,
+      attendance: att,
+      weekStart,
+    });
+    due += r.totalPaise + (bonusByWorker.get(wId) ?? 0);
+  }
+  return due;
+}
 
 /**
  * Dashboard composite query — everything the Home screen needs in one round trip.
@@ -25,7 +86,7 @@ export async function dashboard(req, res, next) {
   try {
     const [user, plantation] = await Promise.all([
       User.findById(req.user.sub),
-      Plantation.findOne({ ownerId: req.user.sub }),
+      Plantation.findOne({ ownerId: req.user.sub }).sort({ createdAt: -1 }),
     ]);
 
     if (!user) {
@@ -51,6 +112,8 @@ export async function dashboard(req, res, next) {
     const acresActive = plots.reduce((s, p) => s + p.acres, 0);
     const unionCount = workers.filter((w) => w.type === 'union').length;
     const tempCount = workers.filter((w) => w.type === 'temp').length;
+
+    const payrollDuePaise = await computePayrollDuePaise(plantation._id);
 
     // Days until the next scheduled application (negative if overdue).
     let daysUntilNextApplication = null;
@@ -82,8 +145,7 @@ export async function dashboard(req, res, next) {
         unionWorkers: unionCount,
         tempWorkers: tempCount,
         daysUntilNextApplication,
-        // Filled in once the Labor module lands.
-        payrollDuePaise: 0,
+        payrollDuePaise,
       },
       alerts: await buildAlerts({
         plantationId: plantation._id,
