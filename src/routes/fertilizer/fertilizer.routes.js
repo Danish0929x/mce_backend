@@ -7,6 +7,8 @@ import {
   createScheduleEntry,
   updateScheduleEntry,
   skipScheduleEntry,
+  adjustFertilizerInventory,
+  updateFertilizerThreshold,
 } from '../../controllers/fertilizer/fertilizer.controller.js';
 
 const router = Router();
@@ -24,5 +26,9 @@ router.post('/schedule/:id/skip', skipScheduleEntry);
 // Application + inventory writes.
 router.post('/applications', markApplied);
 router.post('/stock-purchases', logStockPurchase);
+
+// Manual inventory operations.
+router.post('/inventory/:id/adjust', adjustFertilizerInventory);
+router.patch('/inventory/:id/threshold', updateFertilizerThreshold);
 
 export default router;

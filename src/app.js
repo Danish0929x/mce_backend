@@ -9,6 +9,7 @@ import dashboardRoutes from './routes/dashboard/dashboard.routes.js';
 import diagnosisRoutes from './routes/diagnosis/diagnosis.routes.js';
 import fertilizerRoutes from './routes/fertilizer/fertilizer.routes.js';
 import healthRoutes from './routes/health.routes.js';
+import inventoryRoutes from './routes/inventory/inventory.routes.js';
 import laborRoutes from './routes/labor/labor.routes.js';
 import plantationRoutes from './routes/plantations/plantations.routes.js';
 
@@ -28,6 +29,7 @@ export function createApp() {
   app.use('/api/v1/plantations', plantationRoutes);
   app.use('/api/v1/dashboard', dashboardRoutes);
   app.use('/api/v1/fertilizer', fertilizerRoutes);
+  app.use('/api/v1/inventory', inventoryRoutes);
   app.use('/api/v1/labor', laborRoutes);
   app.use('/api/v1/diagnosis', diagnosisRoutes);
 

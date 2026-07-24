@@ -242,6 +242,99 @@ export async function logStockPurchase(req, res, next) {
   }
 }
 
+// ---------- Manual inventory ops (adjust + edit threshold) ----------
+
+const adjustInventorySchema = z.object({
+  deltaKg: z.number().refine((n) => n !== 0, 'delta must be non-zero'),
+  reason: z.string().trim().min(2).max(200),
+});
+
+/**
+ * Apply a manual +/- delta to a fertilizer inventory row (spill, correction).
+ * The delta is stored in `StockPurchase` with a null price so history stays
+ * on a single timeline — reason is recorded as the supplier string.
+ */
+export async function adjustFertilizerInventory(req, res, next) {
+  const session = await mongoose.startSession();
+  try {
+    const body = adjustInventorySchema.parse(req.body);
+    const plantation = await Plantation.findOne({ ownerId: req.user.sub });
+    if (!plantation) {
+      return res.status(404).json({ error: 'no_plantation' });
+    }
+
+    const inv = await Inventory.findOne({
+      _id: req.params.id,
+      plantationId: plantation._id,
+    });
+    if (!inv) return res.status(404).json({ error: 'inventory_not_found' });
+
+    const deltaGrams = Math.round(body.deltaKg * 1000);
+    if (inv.quantityGrams + deltaGrams < 0) {
+      return res.status(400).json({
+        error: 'insufficient_stock',
+        message: 'Cannot subtract more than the current stock.',
+      });
+    }
+
+    let invDoc, logDoc;
+    await session.withTransaction(async () => {
+      invDoc = await Inventory.findByIdAndUpdate(
+        inv._id,
+        { $inc: { quantityGrams: deltaGrams } },
+        { new: true, session },
+      );
+      [logDoc] = await StockPurchase.create(
+        [
+          {
+            plantationId: plantation._id,
+            fertilizerId: inv.fertilizerId,
+            quantityGrams: deltaGrams, // Signed — can be negative.
+            pricePerKgPaise: 0,
+            totalCostPaise: 0,
+            supplier: `Adjustment · ${body.reason}`,
+            purchasedAt: new Date(),
+          },
+        ],
+        { session },
+      );
+    });
+
+    res.json({
+      ok: true,
+      inventory: invDoc.toPublicJSON(),
+      log: logDoc.toPublicJSON(),
+    });
+  } catch (err) {
+    next(toHttpError(err));
+  } finally {
+    session.endSession();
+  }
+}
+
+const updateThresholdSchema = z.object({
+  lowStockThresholdKg: z.number().nonnegative(),
+});
+
+export async function updateFertilizerThreshold(req, res, next) {
+  try {
+    const body = updateThresholdSchema.parse(req.body);
+    const plantation = await Plantation.findOne({ ownerId: req.user.sub });
+    if (!plantation) {
+      return res.status(404).json({ error: 'no_plantation' });
+    }
+    const inv = await Inventory.findOneAndUpdate(
+      { _id: req.params.id, plantationId: plantation._id },
+      { lowStockThresholdGrams: Math.round(body.lowStockThresholdKg * 1000) },
+      { new: true },
+    );
+    if (!inv) return res.status(404).json({ error: 'inventory_not_found' });
+    res.json({ ok: true, inventory: inv.toPublicJSON() });
+  } catch (err) {
+    next(toHttpError(err));
+  }
+}
+
 const createScheduleSchema = z.object({
   fertilizerId: z.string().min(8),
   plotId: z.string().min(8).optional().nullable(),
