@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parse as parseCsv } from 'csv-parse/sync';
 import { Plantation } from '../../models/Plantation.js';
 import { Worker } from '../../models/Worker.js';
 import { Attendance } from '../../models/Attendance.js';
@@ -100,6 +101,158 @@ export async function createWorker(req, res, next) {
           : null,
     });
     res.status(201).json({ ok: true, worker: w.toPublicJSON() });
+  } catch (err) {
+    next(toHttpError(err));
+  }
+}
+
+// ---------- Bulk CSV import ----------
+
+const bulkImportBodySchema = z.object({
+  csv: z.string().min(1).max(1_000_000), // ~1 MB of CSV text is plenty.
+});
+
+/**
+ * Per-row Zod schema. `phone` normalized to E.164 (+91XXXXXXXXXX). `type`
+ * accepts either "union"/"temp" case-insensitively. Empty strings from the
+ * CSV parser are stripped BEFORE parsing so `.optional()` behaves as expected.
+ */
+const bulkImportRowSchema = z.object({
+  fullName: z.string().trim().min(2).max(120),
+  type: z.enum(['union', 'temp']),
+  phone: z.string().regex(/^\+91\d{10}$/).optional(),
+  joinedAt: z.coerce.date(),
+  tempPayType: z.enum(['daily', 'hourly']).optional(),
+  tempRateRupees: z.coerce.number().positive().optional(),
+});
+
+/** Normalize a phone into E.164 (+91XXXXXXXXXX) or return null. */
+function normalizePhone(raw) {
+  if (raw == null) return null;
+  const s = String(raw).replace(/[\s\-()]/g, '');
+  if (!s) return null;
+  if (/^\+91\d{10}$/.test(s)) return s;
+  if (/^91\d{10}$/.test(s)) return `+${s}`;
+  if (/^\d{10}$/.test(s)) return `+91${s}`;
+  return s; // Let the schema reject it.
+}
+
+export async function bulkImportWorkers(req, res, next) {
+  try {
+    const { csv } = bulkImportBodySchema.parse(req.body);
+    const p = await getCallerPlantation(req);
+    if (!p) return res.status(404).json({ error: 'no_plantation' });
+
+    let rawRows;
+    try {
+      rawRows = parseCsv(csv, {
+        columns: (headers) => headers.map((h) => h.trim()),
+        skip_empty_lines: true,
+        trim: true,
+        bom: true,
+        relax_column_count: true,
+      });
+    } catch (e) {
+      return res
+        .status(400)
+        .json({ error: 'csv_parse_error', message: e.message });
+    }
+
+    if (rawRows.length === 0) {
+      return res
+        .status(400)
+        .json({ error: 'empty_csv', message: 'CSV has no data rows.' });
+    }
+
+    // De-dup against phones already on file for this plantation.
+    const existing = await Worker.find({ plantationId: p._id })
+      .select('phone')
+      .lean();
+    const existingPhones = new Set(
+      existing.map((w) => w.phone).filter(Boolean),
+    );
+
+    const seenPhones = new Set();
+    const toCreate = [];
+    const skipped = [];
+
+    for (let i = 0; i < rawRows.length; i++) {
+      const rowNumber = i + 2; // Row 1 is the header line.
+      const raw = rawRows[i];
+
+      // Strip empty strings so `.optional()` fires instead of failing on "".
+      const cleaned = {};
+      for (const [k, v] of Object.entries(raw)) {
+        if (v === undefined || v === null) continue;
+        const s = typeof v === 'string' ? v.trim() : v;
+        if (s === '') continue;
+        cleaned[k] = s;
+      }
+      if (cleaned.phone !== undefined) {
+        cleaned.phone = normalizePhone(cleaned.phone);
+      }
+      if (typeof cleaned.type === 'string') {
+        cleaned.type = cleaned.type.toLowerCase();
+      }
+      if (typeof cleaned.tempPayType === 'string') {
+        cleaned.tempPayType = cleaned.tempPayType.toLowerCase();
+      }
+
+      const parsed = bulkImportRowSchema.safeParse(cleaned);
+      if (!parsed.success) {
+        skipped.push({
+          row: rowNumber,
+          reason: parsed.error.issues
+            .map((iss) => `${iss.path.join('.') || 'row'}: ${iss.message}`)
+            .join('; '),
+        });
+        continue;
+      }
+      const b = parsed.data;
+
+      if (b.type === 'temp') {
+        if (!b.tempPayType || b.tempRateRupees == null) {
+          skipped.push({
+            row: rowNumber,
+            reason: 'Temp workers require tempPayType and tempRateRupees.',
+          });
+          continue;
+        }
+      }
+
+      if (b.phone) {
+        if (existingPhones.has(b.phone) || seenPhones.has(b.phone)) {
+          skipped.push({
+            row: rowNumber,
+            reason: `Duplicate phone ${b.phone}`,
+          });
+          continue;
+        }
+        seenPhones.add(b.phone);
+      }
+
+      toCreate.push({
+        plantationId: p._id,
+        fullName: b.fullName,
+        type: b.type,
+        phone: b.phone ?? null,
+        joinedAt: b.joinedAt,
+        tempPayType: b.type === 'temp' ? b.tempPayType : null,
+        tempRatePaise:
+          b.type === 'temp'
+            ? rupeesToPaise(String(b.tempRateRupees))
+            : null,
+      });
+    }
+
+    const created = toCreate.length ? await Worker.insertMany(toCreate) : [];
+
+    res.json({
+      ok: true,
+      imported: created.length,
+      skipped,
+      workers: created.map((w) => w.toPublicJSON()),
+    });
   } catch (err) {
     next(toHttpError(err));
   }

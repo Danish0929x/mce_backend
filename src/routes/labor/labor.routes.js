@@ -4,6 +4,7 @@ import {
   listWorkers,
   createWorker,
   updateWorker,
+  bulkImportWorkers,
   getAttendanceByDate,
   upsertAttendance,
   getWeeklyPayroll,
@@ -29,6 +30,7 @@ router.use(requireAuth);
 // Workers
 router.get('/workers', listWorkers);
 router.post('/workers', createWorker);
+router.post('/workers/bulk-import', bulkImportWorkers);
 router.patch('/workers/:id', updateWorker);
 
 // Attendance
