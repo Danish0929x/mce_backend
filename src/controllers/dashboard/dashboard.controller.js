@@ -65,51 +65,98 @@ async function computeWeekSpendPaise(plantationId, weekStart, weekEnd) {
 }
 
 /**
- * Sum of unpaid wages + bonuses across all active workers for the current
- * week. Mirrors the Weekly Payroll screen's totals but only counts workers
- * whose PayrollWeek row is missing or unpaid. Already-paid weeks contribute 0.
+ * Rolling 12-week walk that sums every ₹ owed to workers across ALL weeks
+ * that still have unpaid attendance. Prevents the dashboard from silently
+ * under-reporting payroll liability when a prior week was marked-attendance-
+ * but-never-marked-paid.
+ *
+ * Returns:
+ *   totalPaise          — cumulative unpaid amount across all weeks
+ *   unpaidWeekCount     — number of weeks with unpaid > 0
+ *   oldestWeekStart     — earliest unpaid week (null if fully paid)
  */
-async function computePayrollDuePaise(plantationId) {
-  const weekStart = startOfWeekMonday(new Date());
-  const weekEnd = new Date(weekStart);
-  weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
-  weekEnd.setUTCHours(23, 59, 59, 999);
+async function computePayrollDueSummary(plantationId) {
+  const currentWeekStart = startOfWeekMonday(new Date());
+  const currentWeekEnd = new Date(currentWeekStart);
+  currentWeekEnd.setUTCDate(currentWeekStart.getUTCDate() + 6);
+  currentWeekEnd.setUTCHours(23, 59, 59, 999);
 
-  const [workers, attendance, paidRows, bonuses] = await Promise.all([
+  // 12 weekly buckets, newest → oldest.
+  const weekStarts = [];
+  for (let i = 0; i < 12; i++) {
+    const d = new Date(currentWeekStart);
+    d.setUTCDate(currentWeekStart.getUTCDate() - 7 * i);
+    weekStarts.push(d);
+  }
+  const oldestBound = weekStarts[weekStarts.length - 1];
+
+  const [workers, allAttendance, allPaidRows, allBonuses] = await Promise.all([
     Worker.find({ plantationId, active: true }),
     Attendance.find({
       plantationId,
-      workDate: { $gte: weekStart, $lte: weekEnd },
+      workDate: { $gte: oldestBound, $lte: currentWeekEnd },
     }),
-    PayrollWeek.find({ plantationId, weekStart }),
+    PayrollWeek.find({
+      plantationId,
+      weekStart: { $gte: oldestBound, $lte: currentWeekStart },
+    }),
     BonusPayment.find({
       plantationId,
-      paidAt: { $gte: weekStart, $lte: weekEnd },
+      paidAt: { $gte: oldestBound, $lte: currentWeekEnd },
     }),
   ]);
 
-  const paidByWorker = new Map(
-    paidRows.map((r) => [r.workerId.toString(), r]),
-  );
-  const bonusByWorker = new Map();
-  for (const b of bonuses) {
-    const key = b.workerId.toString();
-    bonusByWorker.set(key, (bonusByWorker.get(key) ?? 0) + b.amountPaise);
+  let totalPaise = 0;
+  let unpaidWeekCount = 0;
+  let oldestWeekStart = null;
+
+  for (const weekStart of weekStarts) {
+    const weekEnd = new Date(weekStart);
+    weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
+    weekEnd.setUTCHours(23, 59, 59, 999);
+
+    const weekAttendance = allAttendance.filter(
+      (a) => a.workDate >= weekStart && a.workDate <= weekEnd,
+    );
+    if (weekAttendance.length === 0) continue;
+
+    const paidWorkerIds = new Set(
+      allPaidRows
+        .filter(
+          (p) => p.weekStart.getTime() === weekStart.getTime() && p.paidAt,
+        )
+        .map((p) => p.workerId.toString()),
+    );
+
+    const bonusByWorker = new Map();
+    for (const b of allBonuses) {
+      if (b.paidAt < weekStart || b.paidAt > weekEnd) continue;
+      const key = b.workerId.toString();
+      bonusByWorker.set(key, (bonusByWorker.get(key) ?? 0) + b.amountPaise);
+    }
+
+    let weekTotal = 0;
+    for (const w of workers) {
+      const wId = w._id.toString();
+      if (paidWorkerIds.has(wId)) continue;
+      const att = weekAttendance.filter((a) => a.workerId.toString() === wId);
+      if (att.length === 0 && !bonusByWorker.has(wId)) continue;
+      const r = await calculateWeeklyPayroll({
+        worker: w,
+        attendance: att,
+        weekStart,
+      });
+      weekTotal += r.totalPaise + (bonusByWorker.get(wId) ?? 0);
+    }
+
+    if (weekTotal > 0) {
+      totalPaise += weekTotal;
+      unpaidWeekCount++;
+      oldestWeekStart = weekStart; // Loop is newest→oldest, so this ends holding the oldest.
+    }
   }
 
-  let due = 0;
-  for (const w of workers) {
-    const wId = w._id.toString();
-    if (paidByWorker.get(wId)?.paidAt) continue; // already paid — nothing due
-    const att = attendance.filter((a) => a.workerId.toString() === wId);
-    const r = await calculateWeeklyPayroll({
-      worker: w,
-      attendance: att,
-      weekStart,
-    });
-    due += r.totalPaise + (bonusByWorker.get(wId) ?? 0);
-  }
-  return due;
+  return { totalPaise, unpaidWeekCount, oldestWeekStart };
 }
 
 /**
@@ -163,8 +210,8 @@ export async function dashboard(req, res, next) {
     weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
     weekEnd.setUTCHours(23, 59, 59, 999);
 
-    const [payrollDuePaise, weekSpend] = await Promise.all([
-      computePayrollDuePaise(plantation._id),
+    const [payrollDue, weekSpend] = await Promise.all([
+      computePayrollDueSummary(plantation._id),
       computeWeekSpendPaise(plantation._id, weekStart, weekEnd),
     ]);
 
@@ -198,7 +245,9 @@ export async function dashboard(req, res, next) {
         unionWorkers: unionCount,
         tempWorkers: tempCount,
         daysUntilNextApplication,
-        payrollDuePaise,
+        payrollDuePaise: payrollDue.totalPaise,
+        payrollUnpaidWeekCount: payrollDue.unpaidWeekCount,
+        payrollOldestUnpaidWeekStart: payrollDue.oldestWeekStart,
         weekStart,
         weekEnd,
         weekSpendPaise: weekSpend.totalPaise,
