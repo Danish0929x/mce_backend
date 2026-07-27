@@ -8,6 +8,8 @@ import { Inventory } from '../../models/Inventory.js';
 import { Attendance } from '../../models/Attendance.js';
 import { PayrollWeek } from '../../models/PayrollWeek.js';
 import { BonusPayment } from '../../models/BonusPayment.js';
+import { StockPurchase } from '../../models/StockPurchase.js';
+import { SupplyLog } from '../../models/SupplyLog.js';
 import { calculateWeeklyPayroll } from '../../services/wage-engine.service.js';
 
 function startOfWeekMonday(date) {
@@ -17,6 +19,49 @@ function startOfWeekMonday(date) {
   const diff = (dow + 6) % 7;
   d.setUTCDate(d.getUTCDate() - diff);
   return d;
+}
+
+/**
+ * Sum of every ₹ that already left the estate this week — paid payroll +
+ * fertilizer stock purchases + supply purchases. Used for the "week spend
+ * so far" card on the dashboard.
+ */
+async function computeWeekSpendPaise(plantationId, weekStart, weekEnd) {
+  const [paidPayroll, stockPurchases, supplyPurchases] = await Promise.all([
+    PayrollWeek.find({
+      plantationId,
+      weekStart,
+      paidAt: { $ne: null },
+    }),
+    StockPurchase.find({
+      plantationId,
+      purchasedAt: { $gte: weekStart, $lte: weekEnd },
+      totalCostPaise: { $gt: 0 },
+    }).select('totalCostPaise'),
+    SupplyLog.find({
+      plantationId,
+      kind: 'purchase',
+      at: { $gte: weekStart, $lte: weekEnd },
+      totalCostPaise: { $gt: 0 },
+    }).select('totalCostPaise'),
+  ]);
+
+  const payrollSpent = paidPayroll.reduce((s, r) => s + (r.totalPaise ?? 0), 0);
+  const stockSpent = stockPurchases.reduce(
+    (s, r) => s + (r.totalCostPaise ?? 0),
+    0,
+  );
+  const supplySpent = supplyPurchases.reduce(
+    (s, r) => s + (r.totalCostPaise ?? 0),
+    0,
+  );
+
+  return {
+    totalPaise: payrollSpent + stockSpent + supplySpent,
+    payrollPaise: payrollSpent,
+    stockPaise: stockSpent,
+    supplyPaise: supplySpent,
+  };
 }
 
 /**
@@ -113,7 +158,15 @@ export async function dashboard(req, res, next) {
     const unionCount = workers.filter((w) => w.type === 'union').length;
     const tempCount = workers.filter((w) => w.type === 'temp').length;
 
-    const payrollDuePaise = await computePayrollDuePaise(plantation._id);
+    const weekStart = startOfWeekMonday(new Date());
+    const weekEnd = new Date(weekStart);
+    weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
+    weekEnd.setUTCHours(23, 59, 59, 999);
+
+    const [payrollDuePaise, weekSpend] = await Promise.all([
+      computePayrollDuePaise(plantation._id),
+      computeWeekSpendPaise(plantation._id, weekStart, weekEnd),
+    ]);
 
     // Days until the next scheduled application (negative if overdue).
     let daysUntilNextApplication = null;
@@ -146,6 +199,14 @@ export async function dashboard(req, res, next) {
         tempWorkers: tempCount,
         daysUntilNextApplication,
         payrollDuePaise,
+        weekStart,
+        weekEnd,
+        weekSpendPaise: weekSpend.totalPaise,
+        weekSpendBreakdown: {
+          payrollPaise: weekSpend.payrollPaise,
+          stockPaise: weekSpend.stockPaise,
+          supplyPaise: weekSpend.supplyPaise,
+        },
       },
       alerts: await buildAlerts({
         plantationId: plantation._id,
