@@ -12,6 +12,7 @@ import healthRoutes from './routes/health.routes.js';
 import inventoryRoutes from './routes/inventory/inventory.routes.js';
 import laborRoutes from './routes/labor/labor.routes.js';
 import plantationRoutes from './routes/plantations/plantations.routes.js';
+import subscriptionRoutes from './routes/subscriptions/subscriptions.routes.js';
 
 export function createApp() {
   const app = express();
@@ -32,6 +33,7 @@ export function createApp() {
   app.use('/api/v1/inventory', inventoryRoutes);
   app.use('/api/v1/labor', laborRoutes);
   app.use('/api/v1/diagnosis', diagnosisRoutes);
+  app.use('/api/v1/subscriptions', subscriptionRoutes);
 
   app.use(notFound);
   app.use(errorHandler);
