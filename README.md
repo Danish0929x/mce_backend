@@ -55,6 +55,18 @@ backend/
   Supabase RLS from the brief).
 - **All times are IST** (`Asia/Kolkata`) regardless of client timezone.
 
+- **CGA wage periods are per estate.** Each planter enters new circulars for
+  their own estate (brief §5.4.5); new estates start with the published
+  circulars from brief §7.3. Changing a period that has started needs the
+  planter's confirmation; changing one with paid payroll needs an admin
+  override (§7.6 rule 103). Grant or revoke admin with:
+
+  ```sh
+  npm run set-role -- +919876543210 admin     # or: planter
+  ```
+
+  The user must have signed in once first.
+
 ## Health check
 
 ```sh

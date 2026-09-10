@@ -27,6 +27,12 @@ const userSchema = new Schema(
       default: 'pro_trial',
     },
     trialEndsAt: { type: Date },
+    /**
+     * 'admin' = internal Griffon staff (brief §3.2). Can override locked wage
+     * periods (§7.6 rule 103). Granted only via `npm run set-role` — never
+     * through the API.
+     */
+    role: { type: String, enum: ['planter', 'admin'], default: 'planter' },
     razorpayCustomerId: { type: String, default: null },
     lastLoginAt: { type: Date, default: null },
   },
@@ -45,6 +51,7 @@ userSchema.methods.toPublicJSON = function () {
     fullName: this.fullName,
     phone: this.phone,
     plan: this.plan,
+    role: this.role,
     trialEndsAt: this.trialEndsAt,
     createdAt: this.createdAt,
   };

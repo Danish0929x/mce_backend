@@ -10,16 +10,17 @@ import { PayrollWeek } from '../../models/PayrollWeek.js';
 import { BonusPayment } from '../../models/BonusPayment.js';
 import { StockPurchase } from '../../models/StockPurchase.js';
 import { SupplyLog } from '../../models/SupplyLog.js';
+import { WagePeriod } from '../../models/WagePeriod.js';
 import { calculateWeeklyPayroll } from '../../services/wage-engine.service.js';
-
-function startOfWeekMonday(date) {
-  const d = new Date(date);
-  d.setUTCHours(0, 0, 0, 0);
-  const dow = d.getUTCDay();
-  const diff = (dow + 6) % 7;
-  d.setUTCDate(d.getUTCDate() - diff);
-  return d;
-}
+import {
+  addDays,
+  daysBetween,
+  endOfDay,
+  istDateOnly,
+  istInstantRange,
+  startOfWeekMonday,
+  todayIST,
+} from '../../utils/dates.js';
 
 /**
  * Sum of every ₹ that already left the estate this week — paid payroll +
@@ -35,13 +36,13 @@ async function computeWeekSpendPaise(plantationId, weekStart, weekEnd) {
     }),
     StockPurchase.find({
       plantationId,
-      purchasedAt: { $gte: weekStart, $lte: weekEnd },
+      purchasedAt: istInstantRange(weekStart, weekEnd),
       totalCostPaise: { $gt: 0 },
     }).select('totalCostPaise'),
     SupplyLog.find({
       plantationId,
       kind: 'purchase',
-      at: { $gte: weekStart, $lte: weekEnd },
+      at: istInstantRange(weekStart, weekEnd),
       totalCostPaise: { $gt: 0 },
     }).select('totalCostPaise'),
   ]);
@@ -76,17 +77,13 @@ async function computeWeekSpendPaise(plantationId, weekStart, weekEnd) {
  *   oldestWeekStart     — earliest unpaid week (null if fully paid)
  */
 async function computePayrollDueSummary(plantationId) {
-  const currentWeekStart = startOfWeekMonday(new Date());
-  const currentWeekEnd = new Date(currentWeekStart);
-  currentWeekEnd.setUTCDate(currentWeekStart.getUTCDate() + 6);
-  currentWeekEnd.setUTCHours(23, 59, 59, 999);
+  const currentWeekStart = startOfWeekMonday(todayIST());
+  const currentWeekEnd = endOfDay(addDays(currentWeekStart, 6));
 
   // 12 weekly buckets, newest → oldest.
   const weekStarts = [];
   for (let i = 0; i < 12; i++) {
-    const d = new Date(currentWeekStart);
-    d.setUTCDate(currentWeekStart.getUTCDate() - 7 * i);
-    weekStarts.push(d);
+    weekStarts.push(addDays(currentWeekStart, -7 * i));
   }
   const oldestBound = weekStarts[weekStarts.length - 1];
 
@@ -102,7 +99,7 @@ async function computePayrollDueSummary(plantationId) {
     }),
     BonusPayment.find({
       plantationId,
-      paidAt: { $gte: oldestBound, $lte: currentWeekEnd },
+      paidAt: istInstantRange(oldestBound, currentWeekEnd),
     }),
   ]);
 
@@ -111,9 +108,8 @@ async function computePayrollDueSummary(plantationId) {
   let oldestWeekStart = null;
 
   for (const weekStart of weekStarts) {
-    const weekEnd = new Date(weekStart);
-    weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
-    weekEnd.setUTCHours(23, 59, 59, 999);
+    const weekEnd = endOfDay(addDays(weekStart, 6));
+    const bonusRange = istInstantRange(weekStart, weekEnd);
 
     const weekAttendance = allAttendance.filter(
       (a) => a.workDate >= weekStart && a.workDate <= weekEnd,
@@ -130,7 +126,7 @@ async function computePayrollDueSummary(plantationId) {
 
     const bonusByWorker = new Map();
     for (const b of allBonuses) {
-      if (b.paidAt < weekStart || b.paidAt > weekEnd) continue;
+      if (b.paidAt < bonusRange.$gte || b.paidAt >= bonusRange.$lt) continue;
       const key = b.workerId.toString();
       bonusByWorker.set(key, (bonusByWorker.get(key) ?? 0) + b.amountPaise);
     }
@@ -205,10 +201,9 @@ export async function dashboard(req, res, next) {
     const unionCount = workers.filter((w) => w.type === 'union').length;
     const tempCount = workers.filter((w) => w.type === 'temp').length;
 
-    const weekStart = startOfWeekMonday(new Date());
-    const weekEnd = new Date(weekStart);
-    weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
-    weekEnd.setUTCHours(23, 59, 59, 999);
+    const today = todayIST();
+    const weekStart = startOfWeekMonday(today);
+    const weekEnd = endOfDay(addDays(weekStart, 6));
 
     const [payrollDue, weekSpend] = await Promise.all([
       computePayrollDueSummary(plantation._id),
@@ -218,11 +213,9 @@ export async function dashboard(req, res, next) {
     // Days until the next scheduled application (negative if overdue).
     let daysUntilNextApplication = null;
     if (nextApplication) {
-      const msPerDay = 86_400_000;
-      const today = new Date();
-      today.setUTCHours(0, 0, 0, 0);
-      daysUntilNextApplication = Math.ceil(
-        (nextApplication.scheduledDate.getTime() - today.getTime()) / msPerDay,
+      daysUntilNextApplication = daysBetween(
+        today,
+        istDateOnly(nextApplication.scheduledDate),
       );
     }
 
@@ -262,6 +255,8 @@ export async function dashboard(req, res, next) {
         inventoryRows,
         nextApplication,
         daysUntilNextApplication,
+        hasUnionWorkers: unionCount > 0,
+        today,
       }),
       inventory: await buildInventorySnapshot(inventoryRows),
       trial: {
@@ -288,14 +283,43 @@ function firstName(fullName) {
  *   - low-stock fertilizer (red)
  *   - overdue fertilizer application (red)
  *   - upcoming application within 3 days (brass)
- * Wage period + bonus alerts come when those modules land.
+ *   - no CGA wage rate for today (red) / circular ending soon (brass)
+ * Bonus alerts come when that module lands.
  */
 async function buildAlerts({
+  plantationId,
   inventoryRows,
   nextApplication,
   daysUntilNextApplication,
+  hasUnionWorkers,
+  today,
 }) {
   const alerts = [];
+
+  // CGA wage period — union pay is ₹0 for any day no circular covers.
+  if (hasUnionWorkers) {
+    const period = await WagePeriod.activeOn(plantationId, today);
+    if (!period) {
+      alerts.push({
+        id: 'wage-period-missing',
+        title: 'No CGA wage rate for today',
+        subtitle: 'Union pay shows ₹0 until you add the new circular rates.',
+        severity: 'danger',
+        deepLink: '/labor/wage-periods',
+      });
+    } else {
+      const endsIn = daysBetween(today, istDateOnly(period.effectiveTo));
+      if (endsIn <= 14) {
+        alerts.push({
+          id: `wage-period-ending-${period._id}`,
+          title: `Wage circular ends in ${endsIn}d`,
+          subtitle: `${period.label} rates expire soon.`,
+          severity: 'warning',
+          deepLink: '/labor/wage-periods',
+        });
+      }
+    }
+  }
 
   // Low-stock fertilizers
   const lowRows = inventoryRows.filter((i) => i.quantityGrams < i.lowStockThresholdGrams);

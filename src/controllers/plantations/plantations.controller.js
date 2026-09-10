@@ -4,7 +4,11 @@ import { Plantation } from '../../models/Plantation.js';
 import { Plot } from '../../models/Plot.js';
 import { Worker } from '../../models/Worker.js';
 import { rupeesToPaise } from '../../utils/money.js';
-import { seedDefaultSchedule } from '../../services/cardamom-seed.service.js';
+import { zDateOnly } from '../../utils/dates.js';
+import {
+  seedDefaultSchedule,
+  seedWagePeriodsForPlantation,
+} from '../../services/cardamom-seed.service.js';
 
 // ---------- validation schemas ----------
 
@@ -22,7 +26,7 @@ const firstWorkerSchema = z.object({
     .regex(/^\+91\d{10}$/)
     .optional()
     .nullable(),
-  joinedAt: z.coerce.date(),
+  joinedAt: zDateOnly,
   tempPayType: z.enum(['daily', 'hourly']).optional().nullable(),
   // Rupees from the client; we convert to paise before save.
   tempRateRupees: z.number().positive().optional().nullable(),
@@ -129,6 +133,13 @@ export async function create(req, res, next) {
         plantationId: plantation._id,
         totalAcres: body.totalAcres,
         startDate: new Date(),
+        session,
+      });
+
+      // The published CGA circulars (brief §7.3). The planter adds newer
+      // ones from the Wage Periods screen.
+      await seedWagePeriodsForPlantation({
+        plantationId: plantation._id,
         session,
       });
     });

@@ -22,6 +22,7 @@
 import { WagePeriod } from '../models/WagePeriod.js';
 import { AnnualConfig } from '../models/AnnualConfig.js';
 import { FestivalDate } from '../models/FestivalDate.js';
+import { addDays, endOfDay, istDateOnly, toDateKey } from '../utils/dates.js';
 
 // ---------- weightage bands (brief §7.2) ----------
 
@@ -54,14 +55,19 @@ export function bandLabel(tenureYears) {
  * Completed full years between joinedAt and refDate — exactly like age.
  * Uses month/day comparison so leap-year drift doesn't bite (an earlier
  * ms-based version under-counted because the actual leap-day total varies).
+ *
+ * Both dates are compared as IST calendar days, so a joinedAt stored as IST
+ * midnight (e.g. 2008-04-14T18:30Z for 15 Apr) still anniversaries on 15 Apr.
  */
 export function tenureYearsAt(joinedAt, refDate) {
   if (!joinedAt) return 0;
-  let years = refDate.getUTCFullYear() - joinedAt.getUTCFullYear();
+  const joined = istDateOnly(joinedAt);
+  const ref = istDateOnly(refDate);
+  let years = ref.getUTCFullYear() - joined.getUTCFullYear();
   const beforeAnniversary =
-    refDate.getUTCMonth() < joinedAt.getUTCMonth() ||
-    (refDate.getUTCMonth() === joinedAt.getUTCMonth() &&
-      refDate.getUTCDate() < joinedAt.getUTCDate());
+    ref.getUTCMonth() < joined.getUTCMonth() ||
+    (ref.getUTCMonth() === joined.getUTCMonth() &&
+      ref.getUTCDate() < joined.getUTCDate());
   if (beforeAnniversary) years--;
   return Math.max(0, years);
 }
@@ -160,7 +166,7 @@ export async function calculateWeeklyPayroll({
 }) {
   const days = 7;
   const config = await loadAnnualConfig(weekStart);
-  const weekEnd = new Date(weekStart.getTime() + 6 * 86_400_000);
+  const weekEnd = endOfDay(addDays(weekStart, 6));
 
   // Fetch festival dates for this plantation that fall inside the week.
   // Brief §5.4.6: union workers are paid on marked festival days regardless
@@ -181,10 +187,13 @@ export async function calculateWeeklyPayroll({
   let daysPresent = 0;
   let festivalDays = 0;
   let totalHours = 0;
+  // Payable union days (present or festival) with no CGA circular on file.
+  // These are paid ₹0 until the rates are entered, so payroll for the week
+  // must not be marked paid while this is non-zero.
+  let missingPeriodDays = 0;
 
   for (let i = 0; i < days; i++) {
-    const workDate = new Date(weekStart);
-    workDate.setUTCDate(weekStart.getUTCDate() + i);
+    const workDate = addDays(weekStart, i);
 
     const row = attendance.find((a) => sameDay(a.workDate, workDate));
     const isPresent = row?.isPresent === true;
@@ -198,8 +207,9 @@ export async function calculateWeeklyPayroll({
 
     let dayResult;
     if (worker.type === 'union') {
-      const period = await WagePeriod.activeOn(workDate);
+      const period = await WagePeriod.activeOn(worker.plantationId, workDate);
       if (!period) {
+        if (isPresent || festival) missingPeriodDays++;
         dayResult = { totalPaise: 0, parts: { missingPeriod: true } };
       } else if (isPresent) {
         dayResult = calculateUnionDailyWage({
@@ -263,6 +273,7 @@ export async function calculateWeeklyPayroll({
     weekEnd,
     daysPresent,
     festivalDays,
+    missingPeriodDays,
     totalHours,
     avgDailyPaise: payableDays > 0 ? Math.round(totalPaise / payableDays) : 0,
     totalPaise,
@@ -274,15 +285,11 @@ export async function calculateWeeklyPayroll({
 
 function sameDay(a, b) {
   if (!a || !b) return false;
-  return (
-    a.getUTCFullYear() === b.getUTCFullYear() &&
-    a.getUTCMonth() === b.getUTCMonth() &&
-    a.getUTCDate() === b.getUTCDate()
-  );
+  return _dayKey(a) === _dayKey(b);
 }
 
 function _dayKey(d) {
-  return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
+  return toDateKey(istDateOnly(d));
 }
 
 async function loadAnnualConfig(refDate) {

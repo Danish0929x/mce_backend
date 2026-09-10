@@ -41,7 +41,7 @@ router.post('/attendance', upsertAttendance);
 router.get('/payroll/week', getWeeklyPayroll);
 router.post('/payroll/mark-paid', markPayrollPaid);
 
-// Wage periods (CGA circular management)
+// Wage periods (CGA circular management, per estate)
 router.get('/wage-periods', listWagePeriods);
 router.post('/wage-periods', createWagePeriod);
 router.patch('/wage-periods/:id', updateWagePeriod);

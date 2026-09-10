@@ -1,4 +1,6 @@
 import mongoose from 'mongoose';
+import { tenureYearsAt } from '../services/wage-engine.service.js';
+import { todayIST } from '../utils/dates.js';
 
 const { Schema } = mongoose;
 
@@ -45,11 +47,9 @@ const workerSchema = new Schema(
   { timestamps: true },
 );
 
-/** Years of full service from joinedAt to now. */
+/** Years of full service from joinedAt to today (IST). */
 workerSchema.methods.tenureYears = function () {
-  if (!this.joinedAt) return 0;
-  const ms = Date.now() - this.joinedAt.getTime();
-  return Math.floor(ms / (365.25 * 24 * 60 * 60 * 1000));
+  return tenureYearsAt(this.joinedAt, todayIST());
 };
 
 workerSchema.methods.toPublicJSON = function () {

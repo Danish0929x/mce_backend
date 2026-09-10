@@ -9,14 +9,24 @@ const { Schema } = mongoose;
  * floats). Active period for any given date is found via:
  *   `effectiveFrom <= date <= effectiveTo`
  *
- * Past periods are immutable once any payroll has been calculated against
- * them. Currently global (all plantations share the same circulars) — this
- * matches reality since CGA sets them across Idukki/Wayanad.
+ * Scoped per plantation: each planter enters the circulars for their own
+ * estate (brief §5.4.5, §7.3), and like every other table a planter can only
+ * touch rows for the plantation they own (§3.2). New plantations are seeded
+ * with the published circulars from brief §7.3.
+ *
+ * Edits to a started period need the planter's confirmation; edits to a
+ * period with paid payroll need an admin override (§7.6 rule 103).
  *
  * @see Developer brief §4.2, §7.3
  */
 const wagePeriodSchema = new Schema(
   {
+    plantationId: {
+      type: Schema.Types.ObjectId,
+      ref: 'Plantation',
+      required: true,
+      index: true,
+    },
     label: { type: String, required: true, trim: true }, // e.g. "Apr–Jun 2026"
     effectiveFrom: { type: Date, required: true, index: true },
     effectiveTo: { type: Date, required: true, index: true },
@@ -24,16 +34,22 @@ const wagePeriodSchema = new Schema(
     daPaise: { type: Number, required: true, min: 0 },
     /** Always equal to basicPaise + daPaise. Stored for convenience. */
     totalPaise: { type: Number, required: true, min: 0 },
-    /** Stable key for upsert-on-seed. Format: 'YYYY-Qx' (e.g. '2026-Q2'). */
-    seedKey: { type: String, default: null, unique: true, sparse: true },
+    /** Set on seeded circulars. Format: 'YYYY-Qx' (e.g. '2026-Q2'). */
+    seedKey: { type: String, default: null },
   },
   { timestamps: true },
 );
 
-wagePeriodSchema.index({ effectiveFrom: 1, effectiveTo: 1 });
+wagePeriodSchema.index({ plantationId: 1, effectiveFrom: 1, effectiveTo: 1 });
+// Each seeded circular at most once per plantation.
+wagePeriodSchema.index(
+  { plantationId: 1, seedKey: 1 },
+  { unique: true, partialFilterExpression: { seedKey: { $type: 'string' } } },
+);
 
-wagePeriodSchema.statics.activeOn = function (date) {
+wagePeriodSchema.statics.activeOn = function (plantationId, date) {
   return this.findOne({
+    plantationId,
     effectiveFrom: { $lte: date },
     effectiveTo: { $gte: date },
   });

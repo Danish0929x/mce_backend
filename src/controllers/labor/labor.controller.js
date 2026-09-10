@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { parse as parseCsv } from 'csv-parse/sync';
 import { Plantation } from '../../models/Plantation.js';
+import { User } from '../../models/User.js';
 import { Worker } from '../../models/Worker.js';
 import { Attendance } from '../../models/Attendance.js';
 import { WagePeriod } from '../../models/WagePeriod.js';
@@ -10,25 +11,31 @@ import { PayrollWeek } from '../../models/PayrollWeek.js';
 import { BonusRule } from '../../models/BonusRule.js';
 import { BonusPayment } from '../../models/BonusPayment.js';
 import { rupeesToPaise } from '../../utils/money.js';
-import { calculateWeeklyPayroll } from '../../services/wage-engine.service.js';
+import {
+  addDays,
+  currentYearIST,
+  daysBetween,
+  endOfDay,
+  istDateOnly,
+  istInstantRange,
+  startOfWeekMonday,
+  todayIST,
+  zDateKey,
+  zDateOnly,
+} from '../../utils/dates.js';
+import {
+  calculateWeeklyPayroll,
+  weightagePaise,
+} from '../../services/wage-engine.service.js';
 import { calculateYearEndSettlement } from '../../services/settlement.service.js';
 
 // ---------- helpers ----------
 
-function startOfDayUTC(dateStr) {
-  const d = new Date(dateStr);
-  d.setUTCHours(0, 0, 0, 0);
-  return d;
-}
-
-/** Start of the ISO week (Monday) containing `date`, at 00:00 UTC. */
-function startOfWeekMonday(date) {
-  const d = new Date(date);
-  d.setUTCHours(0, 0, 0, 0);
-  const dow = d.getUTCDay(); // 0=Sun, 1=Mon, …, 6=Sat
-  const diff = (dow + 6) % 7; // days since most recent Monday
-  d.setUTCDate(d.getUTCDate() - diff);
-  return d;
+/** Parse an optional date-only query param, falling back to today (IST). */
+function queryDateOr(value, fallback) {
+  if (!value) return fallback;
+  const d = istDateOnly(String(value));
+  return Number.isNaN(d.getTime()) ? fallback : d;
 }
 
 async function getCallerPlantation(req) {
@@ -68,7 +75,7 @@ const createWorkerSchema = z.object({
   fullName: z.string().trim().min(2).max(120),
   type: z.enum(['union', 'temp']),
   phone: z.string().regex(/^\+91\d{10}$/).optional().nullable(),
-  joinedAt: z.coerce.date(),
+  joinedAt: zDateOnly,
   tempPayType: z.enum(['daily', 'hourly']).optional().nullable(),
   tempRateRupees: z.number().positive().optional().nullable(),
 });
@@ -121,7 +128,7 @@ const bulkImportRowSchema = z.object({
   fullName: z.string().trim().min(2).max(120),
   type: z.enum(['union', 'temp']),
   phone: z.string().regex(/^\+91\d{10}$/).optional(),
-  joinedAt: z.coerce.date(),
+  joinedAt: zDateOnly,
   tempPayType: z.enum(['daily', 'hourly']).optional(),
   tempRateRupees: z.coerce.number().positive().optional(),
 });
@@ -262,7 +269,7 @@ const updateWorkerSchema = z
   .object({
     fullName: z.string().trim().min(2).max(120).optional(),
     phone: z.string().regex(/^\+91\d{10}$/).nullable().optional(),
-    joinedAt: z.coerce.date().optional(),
+    joinedAt: zDateOnly.optional(),
     tempRateRupees: z.number().positive().nullable().optional(),
     active: z.boolean().optional(),
   })
@@ -301,7 +308,7 @@ export async function updateWorker(req, res, next) {
 
 const attendanceUpsertSchema = z.object({
   workerId: z.string().min(8),
-  workDate: z.coerce.date(),
+  workDate: zDateOnly,
   isPresent: z.boolean(),
   hoursWorked: z.number().min(0).max(24).optional(),
   sprayingFlag: z.boolean().optional(),
@@ -315,7 +322,7 @@ export async function getAttendanceByDate(req, res, next) {
     const p = await getCallerPlantation(req);
     if (!p) return res.status(404).json({ error: 'no_plantation' });
 
-    const date = req.query.date ? startOfDayUTC(req.query.date) : startOfDayUTC(new Date().toISOString());
+    const date = queryDateOr(req.query.date, todayIST());
 
     const workers = await Worker.find({ plantationId: p._id, active: true })
       .sort({ createdAt: 1 });
@@ -360,7 +367,13 @@ export async function upsertAttendance(req, res, next) {
     const w = await Worker.findOne({ _id: body.workerId, plantationId: p._id });
     if (!w) return res.status(404).json({ error: 'worker_not_found' });
 
-    const workDate = startOfDayUTC(body.workDate);
+    const workDate = body.workDate;
+    if (workDate > todayIST()) {
+      return res.status(400).json({
+        error: 'future_date',
+        message: 'Attendance cannot be marked for a future date.',
+      });
+    }
 
     const row = await Attendance.findOneAndUpdate(
       { workerId: w._id, workDate },
@@ -401,13 +414,9 @@ export async function getWeeklyPayroll(req, res, next) {
     const p = await getCallerPlantation(req);
     if (!p) return res.status(404).json({ error: 'no_plantation' });
 
-    const baseDate = req.query.start
-      ? startOfDayUTC(req.query.start)
-      : new Date();
-    const weekStart = startOfWeekMonday(baseDate);
-    const weekEnd = new Date(weekStart);
-    weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
-    weekEnd.setUTCHours(23, 59, 59, 999);
+    const today = todayIST();
+    const weekStart = startOfWeekMonday(queryDateOr(req.query.start, today));
+    const weekEnd = endOfDay(addDays(weekStart, 6));
 
     const workers = await Worker.find({ plantationId: p._id, active: true });
 
@@ -431,7 +440,7 @@ export async function getWeeklyPayroll(req, res, next) {
     // merge in the breakdowns loop below.
     const bonusesInWeek = await BonusPayment.find({
       plantationId: p._id,
-      paidAt: { $gte: weekStart, $lte: weekEnd },
+      paidAt: istInstantRange(weekStart, weekEnd),
     });
     const bonusByWorker = new Map();
     for (const b of bonusesInWeek) {
@@ -497,21 +506,13 @@ export async function getWeeklyPayroll(req, res, next) {
     );
 
     // Active wage period + warning if it expires within 30 days
-    const active = await WagePeriod.activeOn(weekStart);
+    const active = await WagePeriod.activeOn(p._id, weekStart);
+    const endsInDays = active
+      ? daysBetween(today, istDateOnly(active.effectiveTo))
+      : null;
     const warning =
-      active &&
-      Math.ceil(
-        (active.effectiveTo.getTime() - Date.now()) / 86_400_000,
-      ) <= 30
-        ? {
-            label: active.label,
-            endsInDays: Math.max(
-              0,
-              Math.ceil(
-                (active.effectiveTo.getTime() - Date.now()) / 86_400_000,
-              ),
-            ),
-          }
+      active && endsInDays <= 30
+        ? { label: active.label, endsInDays: Math.max(0, endsInDays) }
         : null;
 
     res.json({
@@ -526,6 +527,7 @@ export async function getWeeklyPayroll(req, res, next) {
       },
       activePeriod: active?.toPublicJSON() ?? null,
       wagePeriodWarning: warning,
+      missingWagePeriodDates: await datesWithoutWagePeriod(p._id, weekStart, 7),
       breakdowns,
     });
   } catch (err) {
@@ -544,7 +546,7 @@ export async function getWeeklyPayroll(req, res, next) {
  */
 const markPaidSchema = z.object({
   workerId: z.string().min(8),
-  weekStart: z.coerce.date(),
+  weekStart: zDateOnly,
 });
 
 export async function markPayrollPaid(req, res, next) {
@@ -554,9 +556,7 @@ export async function markPayrollPaid(req, res, next) {
     if (!p) return res.status(404).json({ error: 'no_plantation' });
 
     const weekStart = startOfWeekMonday(body.weekStart);
-    const weekEnd = new Date(weekStart);
-    weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
-    weekEnd.setUTCHours(23, 59, 59, 999);
+    const weekEnd = endOfDay(addDays(weekStart, 6));
 
     const worker = await Worker.findOne({
       _id: body.workerId,
@@ -580,7 +580,7 @@ export async function markPayrollPaid(req, res, next) {
       }),
       BonusPayment.find({
         workerId: worker._id,
-        paidAt: { $gte: weekStart, $lte: weekEnd },
+        paidAt: istInstantRange(weekStart, weekEnd),
       }),
     ]);
     const r = await calculateWeeklyPayroll({
@@ -588,6 +588,17 @@ export async function markPayrollPaid(req, res, next) {
       attendance: att,
       weekStart,
     });
+
+    // Paying now would freeze ₹0 for days with no CGA circular on file.
+    if (r.missingPeriodDays > 0) {
+      return res.status(409).json({
+        error: 'missing_wage_period',
+        message:
+          `No CGA wage rate is on file for ${r.missingPeriodDays} day(s) this week, ` +
+          'so they would be paid ₹0. Wait until the new circular rates are added.',
+      });
+    }
+
     const bonusPaise = bonuses.reduce((s, b) => s + b.amountPaise, 0);
 
     const doc = await PayrollWeek.findOneAndUpdate(
@@ -619,23 +630,75 @@ export async function markPayrollPaid(req, res, next) {
 }
 
 // ============================================================
-// WAGE PERIODS (read-only for now)
+// WAGE PERIODS (CGA circulars — entered per estate by the planter)
 // ============================================================
 
-export async function listWagePeriods(_req, res, next) {
+function periodStatus(period, today) {
+  if (period.effectiveFrom > today) return 'upcoming';
+  if (period.effectiveTo < today) return 'past';
+  return 'active';
+}
+
+/**
+ * 'YYYY-MM-DD' keys of the [days] days from [from] that no wage period of
+ * this plantation covers. Union pay for those days is ₹0 until the planter
+ * adds the circular.
+ */
+async function datesWithoutWagePeriod(plantationId, from, days) {
+  const to = endOfDay(addDays(from, days - 1));
+  const periods = await WagePeriod.find({
+    plantationId,
+    effectiveFrom: { $lte: to },
+    effectiveTo: { $gte: from },
+  });
+  const missing = [];
+  for (let i = 0; i < days; i++) {
+    const day = addDays(from, i);
+    const covered = periods.some(
+      (p) => p.effectiveFrom <= day && p.effectiveTo >= day,
+    );
+    if (!covered) missing.push(day.toISOString().slice(0, 10));
+  }
+  return missing;
+}
+
+/**
+ * Paid (settled) union payroll weeks of this plantation overlapping
+ * [from, to]. Those weeks were frozen at the rates in force when paid.
+ */
+function countPaidUnionWeeks(plantationId, from, to) {
+  return PayrollWeek.countDocuments({
+    plantationId,
+    paidAt: { $ne: null },
+    weekStart: { $lte: to },
+    weekEnd: { $gte: from },
+    // Union days carry basicPaise in their breakdown; temp days don't.
+    'days.parts.basicPaise': { $exists: true },
+  });
+}
+
+async function findOverlappingPeriod(plantationId, from, to, excludeId = null) {
+  return WagePeriod.findOne({
+    plantationId,
+    effectiveFrom: { $lte: to },
+    effectiveTo: { $gte: from },
+    ...(excludeId ? { _id: { $ne: excludeId } } : {}),
+  });
+}
+
+export async function listWagePeriods(req, res, next) {
   try {
-    const periods = await WagePeriod.find({}).sort({ effectiveFrom: 1 });
-    const now = new Date();
+    const p = await getCallerPlantation(req);
+    if (!p) return res.status(404).json({ error: 'no_plantation' });
+    const periods = await WagePeriod.find({ plantationId: p._id }).sort({
+      effectiveFrom: 1,
+    });
+    const today = todayIST();
     res.json({
       ok: true,
       periods: periods.map((p) => ({
         ...p.toPublicJSON(),
-        status:
-          p.effectiveFrom > now
-            ? 'upcoming'
-            : p.effectiveTo < now
-            ? 'past'
-            : 'active',
+        status: periodStatus(p, today),
       })),
     });
   } catch (err) {
@@ -645,8 +708,8 @@ export async function listWagePeriods(_req, res, next) {
 
 const wagePeriodFields = z.object({
   label: z.string().trim().min(2).max(40),
-  effectiveFrom: z.coerce.date(),
-  effectiveTo: z.coerce.date(),
+  effectiveFrom: zDateKey,
+  effectiveTo: zDateKey,
   basicRupees: z.number().positive().max(10_000),
   daRupees: z.number().nonnegative().max(10_000),
 });
@@ -656,16 +719,16 @@ const wagePeriodCreateSchema = wagePeriodFields.refine(
   { message: 'effectiveTo must be after effectiveFrom' },
 );
 
-/** POST /labor/wage-periods — add a new CGA circular. */
+/** POST /labor/wage-periods — add a new CGA circular for the caller's estate. */
 export async function createWagePeriod(req, res, next) {
   try {
     const body = wagePeriodCreateSchema.parse(req.body);
+    const p = await getCallerPlantation(req);
+    if (!p) return res.status(404).json({ error: 'no_plantation' });
+    const effectiveFrom = body.effectiveFrom;
+    const effectiveTo = endOfDay(body.effectiveTo);
 
-    // Reject overlaps with any existing period.
-    const overlap = await WagePeriod.findOne({
-      effectiveFrom: { $lte: body.effectiveTo },
-      effectiveTo: { $gte: body.effectiveFrom },
-    });
+    const overlap = await findOverlappingPeriod(p._id, effectiveFrom, effectiveTo);
     if (overlap) {
       return res.status(409).json({
         error: 'overlap',
@@ -676,9 +739,10 @@ export async function createWagePeriod(req, res, next) {
     const basicPaise = Math.round(body.basicRupees * 100);
     const daPaise = Math.round(body.daRupees * 100);
     const doc = await WagePeriod.create({
+      plantationId: p._id,
       label: body.label,
-      effectiveFrom: body.effectiveFrom,
-      effectiveTo: body.effectiveTo,
+      effectiveFrom,
+      effectiveTo,
       basicPaise,
       daPaise,
       totalPaise: basicPaise + daPaise,
@@ -689,10 +753,21 @@ export async function createWagePeriod(req, res, next) {
   }
 }
 
-const wagePeriodUpdateSchema = wagePeriodFields.partial().refine(
-  (v) => Object.keys(v).length > 0,
-  { message: 'Provide at least one field to update.' },
-);
+const wagePeriodUpdateSchema = wagePeriodFields
+  .partial()
+  .extend({
+    /** Caller has confirmed editing a period that has already started. */
+    confirm: z.boolean().optional(),
+    /** Admin override for a period with settled (paid) payroll. */
+    override: z.boolean().optional(),
+  })
+  .refine(
+    (v) =>
+      ['label', 'effectiveFrom', 'effectiveTo', 'basicRupees', 'daRupees'].some(
+        (k) => v[k] !== undefined,
+      ),
+    { message: 'Provide at least one field to update.' },
+  );
 
 // ============================================================
 // FESTIVAL CALENDAR
@@ -704,7 +779,7 @@ export async function listFestivals(req, res, next) {
     const p = await getCallerPlantation(req);
     if (!p) return res.status(404).json({ error: 'no_plantation' });
 
-    const year = Number(req.query.year) || new Date().getUTCFullYear();
+    const year = Number(req.query.year) || currentYearIST();
     const start = new Date(Date.UTC(year, 0, 1));
     const end = new Date(Date.UTC(year, 11, 31, 23, 59, 59));
 
@@ -728,7 +803,7 @@ export async function listFestivals(req, res, next) {
 }
 
 const festivalSchema = z.object({
-  date: z.coerce.date(),
+  date: zDateOnly,
   label: z.string().trim().min(1).max(80),
 });
 
@@ -739,7 +814,7 @@ export async function createFestival(req, res, next) {
     const p = await getCallerPlantation(req);
     if (!p) return res.status(404).json({ error: 'no_plantation' });
 
-    const date = startOfDayUTC(body.date);
+    const date = body.date;
     const year = date.getUTCFullYear();
 
     // Enforce annual cap from AnnualConfig.festivalDays (defaults to 13).
@@ -811,7 +886,7 @@ export async function getYearEndSettlement(req, res, next) {
     const p = await getCallerPlantation(req);
     if (!p) return res.status(404).json({ error: 'no_plantation' });
 
-    const year = Number(req.query.year) || new Date().getUTCFullYear();
+    const year = Number(req.query.year) || currentYearIST();
 
     const workers = await Worker.find({
       plantationId: p._id,
@@ -876,11 +951,7 @@ export async function getGratuityTracker(req, res, next) {
       type: 'union',
     });
 
-    const now = new Date();
-    const activePeriod = await WagePeriod.activeOn(now);
-    const config = await AnnualConfig.findOne({
-      year: now.getUTCFullYear(),
-    });
+    const activePeriod = await WagePeriod.activeOn(p._id, todayIST());
 
     const rows = [];
     let totalLiabilityPaise = 0;
@@ -888,23 +959,9 @@ export async function getGratuityTracker(req, res, next) {
       const tenure = w.tenureYears();
       let dailyPaise = 0;
       if (activePeriod) {
-        const result = calculateWeeklyPayroll
-          ? null
-          : null;
-        // Compute today's daily wage for this worker (no spraying/shade).
-        // Inline lightweight calc to avoid circular import on wage-engine.
-        const weightage = tenure < 6
-            ? 0
-            : tenure <= 10
-                ? 125
-                : tenure <= 15
-                    ? 175
-                    : tenure <= 20
-                        ? 230
-                        : 280;
-        dailyPaise = activePeriod.basicPaise + activePeriod.daPaise + weightage;
-        void result;
-        void config;
+        // Today's daily wage for this worker (no spraying/shade).
+        dailyPaise =
+          activePeriod.basicPaise + activePeriod.daPaise + weightagePaise(tenure);
       }
       const eligible = tenure >= 5;
       const liabilityPaise = eligible ? 15 * tenure * dailyPaise : 0;
@@ -923,6 +980,8 @@ export async function getGratuityTracker(req, res, next) {
       ok: true,
       totalLiabilityPaise,
       activePeriodLabel: activePeriod?.label ?? null,
+      // No circular covers today → every daily wage above is ₹0.
+      missingWagePeriod: !activePeriod,
       rows,
     });
   } catch (err) {
@@ -948,9 +1007,9 @@ export async function listBonuses(req, res, next) {
       Worker.find({ plantationId: p._id, active: true }),
     ]);
 
-    // Compute upcoming firings within the next 30 days.
-    const now = new Date();
-    const horizon = new Date(now.getTime() + 30 * 86_400_000);
+    // Compute upcoming firings within the next 30 days (today included).
+    const now = todayIST();
+    const horizon = addDays(now, 30);
     const upcoming = [];
     for (const rule of rules) {
       if (rule.type === 'festive') {
@@ -976,8 +1035,8 @@ export async function listBonuses(req, res, next) {
         // Workers who *will hit* the milestone within the next 30 days.
         const matching = workers.filter((w) => {
           if (rule.appliesTo !== 'all' && w.type !== rule.appliesTo) return false;
-          const joined = w.joinedAt;
-          if (!joined) return false;
+          if (!w.joinedAt) return false;
+          const joined = istDateOnly(w.joinedAt);
           // Find the upcoming anniversary date.
           const yrs = rule.triggerYears ?? 0;
           const anniversary = new Date(joined);
@@ -1118,26 +1177,126 @@ export async function deleteBonusPayment(req, res, next) {
   }
 }
 
-/** PATCH /labor/wage-periods/:id — edit an existing circular. */
+/**
+ * PATCH /labor/wage-periods/:id — edit a circular of the caller's estate.
+ *
+ * Changing dates or rates is guarded (brief AC 72, §7.6 rule 103):
+ *   - period has settled (paid) payroll → needs an admin override:
+ *       planter → 409 `period_locked` (can't change it from the app)
+ *       admin   → 409 `override_required` unless `override`
+ *   - period has already started        → 409 `confirmation_required`
+ *                                         unless `confirm` (or `override`)
+ * Label-only edits skip both checks. Paid weeks are never recalculated —
+ * they keep the frozen snapshot from when they were paid.
+ *
+ * Admins may edit any estate's period (support); planters only their own.
+ */
 export async function updateWagePeriod(req, res, next) {
   try {
     const body = wagePeriodUpdateSchema.parse(req.body);
-    const doc = await WagePeriod.findById(req.params.id);
+    const caller = await User.findById(req.user.sub).select('role');
+    const isAdmin = caller?.role === 'admin';
+
+    let doc;
+    if (isAdmin) {
+      doc = await WagePeriod.findById(req.params.id);
+    } else {
+      const p = await getCallerPlantation(req);
+      if (!p) return res.status(404).json({ error: 'no_plantation' });
+      doc = await WagePeriod.findOne({ _id: req.params.id, plantationId: p._id });
+    }
     if (!doc) return res.status(404).json({ error: 'period_not_found' });
 
-    if (body.label !== undefined) doc.label = body.label;
-    if (body.effectiveFrom !== undefined) doc.effectiveFrom = body.effectiveFrom;
-    if (body.effectiveTo !== undefined) doc.effectiveTo = body.effectiveTo;
-    if (body.basicRupees !== undefined) doc.basicPaise = Math.round(body.basicRupees * 100);
-    if (body.daRupees !== undefined) doc.daPaise = Math.round(body.daRupees * 100);
-    doc.totalPaise = doc.basicPaise + doc.daPaise;
+    const effectiveFrom = body.effectiveFrom ?? doc.effectiveFrom;
+    const effectiveTo =
+      body.effectiveTo !== undefined ? endOfDay(body.effectiveTo) : doc.effectiveTo;
+    const basicPaise =
+      body.basicRupees !== undefined
+        ? Math.round(body.basicRupees * 100)
+        : doc.basicPaise;
+    const daPaise =
+      body.daRupees !== undefined
+        ? Math.round(body.daRupees * 100)
+        : doc.daPaise;
 
-    if (doc.effectiveTo <= doc.effectiveFrom) {
+    if (effectiveTo <= effectiveFrom) {
       return res.status(400).json({
         error: 'invalid_range',
         message: 'effectiveTo must be after effectiveFrom',
       });
     }
+
+    const payImpacting =
+      effectiveFrom.getTime() !== doc.effectiveFrom.getTime() ||
+      effectiveTo.getTime() !== doc.effectiveTo.getTime() ||
+      basicPaise !== doc.basicPaise ||
+      daPaise !== doc.daPaise;
+
+    if (payImpacting) {
+      const overlap = await findOverlappingPeriod(
+        doc.plantationId,
+        effectiveFrom,
+        effectiveTo,
+        doc._id,
+      );
+      if (overlap) {
+        return res.status(409).json({
+          error: 'overlap',
+          message: `Date range overlaps with "${overlap.label}".`,
+        });
+      }
+
+      // Cover both the old and new range — shrinking a period also changes
+      // pay for the days it no longer covers.
+      const rangeFrom = new Date(
+        Math.min(effectiveFrom.getTime(), doc.effectiveFrom.getTime()),
+      );
+      const rangeTo = new Date(
+        Math.max(effectiveTo.getTime(), doc.effectiveTo.getTime()),
+      );
+      const paidWeekCount = await countPaidUnionWeeks(
+        doc.plantationId,
+        rangeFrom,
+        rangeTo,
+      );
+      if (paidWeekCount > 0 && !isAdmin) {
+        return res.status(409).json({
+          error: 'period_locked',
+          paidWeekCount,
+          message:
+            `${paidWeekCount} paid payroll week(s) used these rates, so they can't ` +
+            'be changed from the app. Contact My Cardamom Estate support — an ' +
+            'admin can override it.',
+        });
+      }
+      if (paidWeekCount > 0 && !body.override) {
+        return res.status(409).json({
+          error: 'override_required',
+          paidWeekCount,
+          message:
+            `${paidWeekCount} paid payroll week(s) used these rates. Paid weeks ` +
+            'will stay as they were paid, but unpaid weeks and year-end figures ' +
+            'will use the new rates. Override?',
+        });
+      }
+
+      const hasStarted = doc.effectiveFrom <= todayIST();
+      if (hasStarted && !body.confirm && !body.override) {
+        return res.status(409).json({
+          error: 'confirmation_required',
+          message:
+            'This period has already started. Editing it will recalculate payroll ' +
+            "that hasn't been paid yet. Continue?",
+        });
+      }
+    }
+
+    if (body.label !== undefined) doc.label = body.label;
+    doc.effectiveFrom = effectiveFrom;
+    doc.effectiveTo = effectiveTo;
+    doc.basicPaise = basicPaise;
+    doc.daPaise = daPaise;
+    doc.totalPaise = basicPaise + daPaise;
 
     await doc.save();
     res.json({ ok: true, period: doc.toPublicJSON() });

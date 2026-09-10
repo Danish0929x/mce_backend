@@ -21,11 +21,8 @@ import { WagePeriod } from '../models/WagePeriod.js';
 import { Attendance } from '../models/Attendance.js';
 import { PayrollWeek } from '../models/PayrollWeek.js';
 import { BonusPayment } from '../models/BonusPayment.js';
-import {
-  calculateUnionDailyWage,
-  calculateTempDailyWage,
-  tenureYearsAt,
-} from './wage-engine.service.js';
+import { calculateUnionDailyWage } from './wage-engine.service.js';
+import { istInstantRange } from '../utils/dates.js';
 
 /**
  * Build the settlement summary for one worker for [year].
@@ -39,8 +36,10 @@ export async function calculateYearEndSettlement({ worker, year }) {
   const yearEnd = new Date(Date.UTC(year, 11, 31, 23, 59, 59));
 
   const [config, attendance, paidWeeks, bonuses] = await Promise.all([
-    AnnualConfig.findOne({ year }) ??
-      AnnualConfig.findOne().sort({ year: -1 }),
+    // Fall back to the latest year on file when this year has no config.
+    AnnualConfig.findOne({ year }).then(
+      (c) => c ?? AnnualConfig.findOne().sort({ year: -1 }),
+    ),
     Attendance.find({
       workerId: worker._id,
       workDate: { $gte: yearStart, $lte: yearEnd },
@@ -51,7 +50,7 @@ export async function calculateYearEndSettlement({ worker, year }) {
     }),
     BonusPayment.find({
       workerId: worker._id,
-      paidAt: { $gte: yearStart, $lte: yearEnd },
+      paidAt: istInstantRange(yearStart, yearEnd),
     }),
   ]);
 
@@ -68,12 +67,12 @@ export async function calculateYearEndSettlement({ worker, year }) {
   // Compute avg daily wage for the year as the mean of all WagePeriod
   // totalPaise that overlap this year. Brief §7.5.
   const periods = await WagePeriod.find({
+    plantationId: worker.plantationId,
     effectiveFrom: { $lte: yearEnd },
     effectiveTo: { $gte: yearStart },
   });
   let avgDailyWagePaise = 0;
   if (worker.type === 'union' && periods.length) {
-    const tenure = tenureYearsAt(worker.joinedAt, new Date(year, 11, 31));
     const weightages = await Promise.all(
       periods.map(async (p) => {
         const probeDate = new Date(
@@ -90,12 +89,10 @@ export async function calculateYearEndSettlement({ worker, year }) {
         return r.totalPaise;
       }),
     );
+    // Weightage is already included via calculateUnionDailyWage above.
     avgDailyWagePaise = Math.round(
       weightages.reduce((s, v) => s + v, 0) / weightages.length,
     );
-    // weightage was already included via calculateUnionDailyWage above.
-    // No further adjustment needed.
-    void tenure; // referenced for clarity, not used past this point.
   } else if (worker.type === 'temp') {
     // For temp workers we use a simple average of paid weeks.
     avgDailyWagePaise =

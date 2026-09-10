@@ -141,31 +141,28 @@ const CGA_CIRCULARS = [
   { seedKey: '2026-Q2', label: 'Apr–Jun 2026', from: '2026-04-01', to: '2026-06-30', basic: 42121, da: 15155 },
 ];
 
-/** Idempotent — upserts by seedKey. Run at every server boot. */
-export async function seedWagePeriods() {
-  const ops = CGA_CIRCULARS.map((c) => ({
-    updateOne: {
-      filter: { seedKey: c.seedKey },
-      update: {
-        $set: {
-          label: c.label,
-          effectiveFrom: new Date(c.from + 'T00:00:00.000Z'),
-          effectiveTo: new Date(c.to + 'T23:59:59.999Z'),
-          basicPaise: c.basic,
-          daPaise: c.da,
-          totalPaise: c.basic + c.da,
-          seedKey: c.seedKey,
-        },
-      },
-      upsert: true,
-    },
+/**
+ * Seed a new plantation with the published circulars (brief §7.3). Newer
+ * circulars are entered by the planter in the app as the CGA issues them.
+ * Run inside the same Mongo session as the plantation insert.
+ *
+ * @param {{ plantationId: any, session?: any }} args
+ */
+export async function seedWagePeriodsForPlantation({ plantationId, session }) {
+  const docs = CGA_CIRCULARS.map((c) => ({
+    plantationId,
+    seedKey: c.seedKey,
+    label: c.label,
+    effectiveFrom: new Date(c.from + 'T00:00:00.000Z'),
+    effectiveTo: new Date(c.to + 'T23:59:59.999Z'),
+    basicPaise: c.basic,
+    daPaise: c.da,
+    totalPaise: c.basic + c.da,
   }));
-  const result = await WagePeriod.bulkWrite(ops);
-  return {
-    upserted: result.upsertedCount ?? 0,
-    modified: result.modifiedCount ?? 0,
-    total: CGA_CIRCULARS.length,
-  };
+  return WagePeriod.create(
+    docs,
+    session ? { session, ordered: true } : undefined,
+  );
 }
 
 /** Default annual config per brief §4.2 — only seeded if missing. */
