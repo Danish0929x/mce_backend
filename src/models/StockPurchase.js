@@ -30,8 +30,18 @@ const stockPurchaseSchema = new Schema(
     totalCostPaise: { type: Number, required: true, min: 0 },
     supplier: { type: String, default: null, trim: true },
     purchasedAt: { type: Date, default: () => new Date(), index: true },
+    /**
+     * Set by the app for purchases logged offline, so a replayed request
+     * (response lost on a weak connection) never adds the stock twice.
+     */
+    clientRequestId: { type: String, default: null },
   },
   { timestamps: true },
+);
+
+stockPurchaseSchema.index(
+  { plantationId: 1, clientRequestId: 1 },
+  { unique: true, partialFilterExpression: { clientRequestId: { $type: 'string' } } },
 );
 
 stockPurchaseSchema.methods.toPublicJSON = function () {

@@ -1,221 +1,166 @@
 import { User } from '../models/User.js';
 import { Subscription } from '../models/Subscription.js';
+import { verifyAppStore, verifyGooglePlay } from './store-verification.service.js';
 
 /**
- * Subscription service for managing App Store purchases.
- * TODO: Integrate with App Store Server API for receipt verification
- * See: https://developer.apple.com/documentation/appstoreserverapi
- */
-
-/**
- * Verify and activate subscription from iOS purchase.
+ * Plans and entitlements — brief §5.5.3.
  *
- * @param {string} userId - User ID
- * @param {string} platform - 'ios' or 'android'
- * @param {string} productId - Product ID (mce_pro_yearly or mce_pro_monthly)
- * @param {string} purchaseToken - Raw receipt/transaction ID
- * @returns {Promise<Object>} Subscription status
- */
-export async function verifySubscription(userId, platform, productId, purchaseToken) {
-  try {
-    if (!['mce_pro_yearly', 'mce_pro_monthly'].includes(productId)) {
-      throw new Error('Invalid product ID');
-    }
-
-    if (!['ios', 'android'].includes(platform)) {
-      throw new Error('Invalid platform');
-    }
-
-    // Verify receipt with Apple
-    const receiptData = await verifyAppleReceipt(purchaseToken);
-
-    if (!receiptData || !receiptData.signedTransactionInfo) {
-      throw new Error('Invalid receipt data from App Store');
-    }
-
-    // Calculate expiration date based on product
-    const now = Date.now();
-    const expiresDateMs = productId === 'mce_pro_yearly'
-      ? now + (365 * 24 * 60 * 60 * 1000)  // 1 year
-      : now + (30 * 24 * 60 * 60 * 1000);  // 30 days (for trial)
-
-    // Create subscription record
-    const subscription = new Subscription({
-      userId,
-      platform,
-      productId,
-      purchaseToken,
-      originalTransactionId: receiptData.originalTransactionId || purchaseToken,
-      purchaseDateMs: receiptData.transactionDateMilliseconds || now,
-      expiresDateMs,
-      isActive: true,
-      isTrial: productId === 'mce_pro_monthly', // Monthly starts as trial
-      verifiedAt: new Date(),
-    });
-
-    await subscription.save();
-
-    // Update user plan to pro
-    await User.findByIdAndUpdate(userId, {
-      plan: 'pro',
-      trialEndsAt: new Date(expiresDateMs),
-    });
-
-    return {
-      success: true,
-      plan: 'pro',
-      expiresAt: new Date(expiresDateMs),
-      subscription: subscription.toObject(),
-    };
-  } catch (error) {
-    console.error('Subscription verification failed:', error);
-    throw error;
-  }
-}
-
-/**
- * Get user's active subscription status.
+ *   pro       — store-verified subscription that has not expired
+ *   pro_trial — 30-day trial from signup (User.trialEndsAt)
+ *   free      — everything else: max 5 active workers, no PDF exports,
+ *               no bulk CSV import
  *
- * @param {string} userId - User ID
- * @returns {Promise<Object>} Current subscription status
+ * The plan is always derived from dates at request time, so a trial or a
+ * lapsed subscription downgrades without any background job.
  */
-export async function getSubscriptionStatus(userId) {
-  try {
-    const user = await User.findById(userId);
-    if (!user) {
-      throw new Error('User not found');
-    }
 
-    // Check for active subscription
-    const activeSubscription = await Subscription.findOne({
-      userId,
-      isActive: true,
-      expiresDateMs: { $gt: Date.now() },
-    }).sort({ createdAt: -1 });
+export const FREE_WORKER_LIMIT = 5;
+/** Pro is a single yearly plan — ₹4,200/year (brief §5.5.3). */
+export const PRODUCT_IDS = ['mce_pro_yearly'];
 
-    if (!activeSubscription) {
-      return {
-        plan: user.plan,
-        isPaid: false,
-        expiresAt: null,
-      };
-    }
-
-    // Update user plan if subscription exists but user plan hasn't synced
-    if (user.plan !== 'pro') {
-      user.plan = 'pro';
-      user.trialEndsAt = new Date(activeSubscription.expiresDateMs);
-      await user.save();
-    }
-
-    return {
-      plan: 'pro',
-      isPaid: !activeSubscription.isTrial,
-      expiresAt: new Date(activeSubscription.expiresDateMs),
-      productId: activeSubscription.productId,
-      isActive: true,
-    };
-  } catch (error) {
-    console.error('Get subscription status failed:', error);
-    throw error;
+/** Effective plan from the user's trial and their latest subscription. */
+export function effectivePlan(user, subscription, now = Date.now()) {
+  if (subscription?.isActive && subscription.expiresDateMs > now) return 'pro';
+  if (user?.trialEndsAt && new Date(user.trialEndsAt).getTime() > now) {
+    return 'pro_trial';
   }
+  return 'free';
 }
 
-/**
- * Check if subscription has expired and update user status.
- * (Call this periodically or on user login)
- *
- * @param {string} userId - User ID
- */
-export async function syncSubscriptionStatus(userId) {
-  try {
-    const user = await User.findById(userId);
-    if (!user) return;
-
-    const activeSubscription = await Subscription.findOne({
-      userId,
-      isActive: true,
-      expiresDateMs: { $gt: Date.now() },
-    }).sort({ createdAt: -1 });
-
-    if (!activeSubscription && user.plan === 'pro') {
-      // Subscription expired, downgrade to free
-      user.plan = 'free';
-      user.trialEndsAt = null;
-      await user.save();
-    } else if (activeSubscription && user.plan !== 'pro') {
-      // Subscription active but user plan not updated
-      user.plan = 'pro';
-      user.trialEndsAt = new Date(activeSubscription.expiresDateMs);
-      await user.save();
-    }
-  } catch (error) {
-    console.error('Sync subscription status failed:', error);
-  }
-}
-
-/**
- * Verify receipt with Apple App Store Server API.
- * Validates that a purchase was legitimate before granting subscription access.
- */
-async function verifyAppleReceipt(transactionId) {
-  try {
-    const token = _generateAppStoreToken();
-
-    const response = await fetch(
-      `https://api.storekit.itunes.apple.com/inApps/v1/transactions/decode/${transactionId}`,
-      {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Accept': 'application/json',
-        }
-      }
-    );
-
-    if (!response.ok) {
-      const error = await response.text();
-      console.error('App Store API error:', error);
-      throw new Error(`App Store verification failed: ${response.status}`);
-    }
-
-    const data = await response.json();
-    return data;
-  } catch (error) {
-    console.error('Receipt verification error:', error);
-    throw new Error(`Failed to verify receipt: ${error.message}`);
-  }
-}
-
-/**
- * Generate JWT token for App Store Server API authentication.
- */
-function _generateAppStoreToken() {
-  const jwt = require('jsonwebtoken');
-
-  const privateKey = process.env.APP_STORE_PRIVATE_KEY;
-  const keyId = process.env.APP_STORE_KEY_ID;
-  const issuerId = process.env.APP_STORE_ISSUER_ID;
-
-  if (!privateKey || !keyId || !issuerId) {
-    throw new Error('Missing App Store Server API configuration in .env');
-  }
-
-  const payload = {
-    iss: issuerId,
-    aud: 'appstoreconnect-v1',
-    iat: Math.floor(Date.now() / 1000),
-    exp: Math.floor(Date.now() / 1000) + 3600, // 1 hour expiry
+export function entitlementsFor(plan) {
+  const pro = plan !== 'free';
+  return {
+    isPro: pro,
+    workerLimit: pro ? null : FREE_WORKER_LIMIT,
+    canExportPdf: pro,
+    canBulkImport: pro,
   };
+}
 
-  const token = jwt.sign(payload, privateKey, {
-    algorithm: 'ES256',
-    header: {
-      alg: 'ES256',
-      kid: keyId,
-      typ: 'JWT',
-    }
+function verifyWithStore(platform, { productId, purchaseToken, transactionId }) {
+  return platform === 'ios'
+    ? verifyAppStore({ transactionId, productId })
+    : verifyGooglePlay({ purchaseToken, productId });
+}
+
+/**
+ * The user's newest subscription. If its paid period has ended, ask the
+ * store once whether it renewed and update the record (best effort — a
+ * store outage leaves the stored state as is).
+ */
+async function latestSubscription(userId) {
+  const sub = await Subscription.findOne({ userId }).sort({ expiresDateMs: -1 });
+  if (!sub || !sub.isActive || sub.expiresDateMs > Date.now()) return sub;
+  try {
+    const ent = await verifyWithStore(sub.platform, {
+      productId: sub.productId,
+      purchaseToken: sub.purchaseToken,
+      transactionId: sub.purchaseToken,
+    });
+    sub.expiresDateMs = ent.expiresDateMs;
+    sub.isActive = ent.active;
+    sub.verifiedAt = new Date();
+    await sub.save();
+  } catch (err) {
+    console.error('Subscription renewal check failed:', err.message);
+  }
+  return sub;
+}
+
+/** Plan + entitlements for [userId], keeping User.plan in sync for display. */
+export async function getEntitlements(userId) {
+  const user = await User.findById(userId);
+  if (!user) {
+    const e = new Error('User not found');
+    e.status = 404;
+    throw e;
+  }
+  const sub = await latestSubscription(userId);
+  const plan = effectivePlan(user, sub);
+  if (user.plan !== plan) {
+    user.plan = plan;
+    await user.save();
+  }
+  return { user, sub, plan, entitlements: entitlementsFor(plan) };
+}
+
+/** Response shape for GET /subscriptions/status. */
+export async function getSubscriptionStatus(userId) {
+  const { user, sub, plan, entitlements } = await getEntitlements(userId);
+  const expiresAt =
+    plan === 'pro'
+      ? new Date(sub.expiresDateMs)
+      : plan === 'pro_trial'
+        ? user.trialEndsAt
+        : null;
+  return {
+    plan,
+    isPaid: plan === 'pro',
+    expiresAt,
+    trialEndsAt: user.trialEndsAt ?? null,
+    productId: plan === 'pro' ? sub.productId : null,
+    entitlements,
+  };
+}
+
+/**
+ * Verify a purchase with the store and attach it to [userId].
+ *
+ * iOS sends the StoreKit transaction ID; Android sends the purchase token.
+ * A purchase already linked to another account is refused, so one
+ * subscription cannot unlock several estates.
+ */
+export async function verifySubscription(
+  userId,
+  { platform, productId, purchaseToken, transactionId },
+) {
+  if (!PRODUCT_IDS.includes(productId)) {
+    const e = new Error('Invalid product ID');
+    e.status = 400;
+    throw e;
+  }
+
+  const ent = await verifyWithStore(platform, {
+    productId,
+    purchaseToken,
+    transactionId,
   });
+  if (!ent.active || ent.expiresDateMs <= Date.now()) {
+    const e = new Error('This subscription is not active.');
+    e.status = 400;
+    e.code = 'subscription_inactive';
+    throw e;
+  }
 
-  return token;
+  const existing = await Subscription.findOne({
+    originalTransactionId: ent.originalTransactionId,
+  });
+  if (existing && existing.userId.toString() !== userId.toString()) {
+    const e = new Error('This purchase is already linked to another account.');
+    e.status = 409;
+    e.code = 'purchase_already_linked';
+    throw e;
+  }
+
+  await Subscription.findOneAndUpdate(
+    { originalTransactionId: ent.originalTransactionId },
+    {
+      $set: {
+        userId,
+        platform,
+        productId,
+        // What the store needs for later renewal checks.
+        purchaseToken: platform === 'ios' ? String(transactionId) : purchaseToken,
+        originalTransactionId: ent.originalTransactionId,
+        purchaseDateMs: ent.purchaseDateMs,
+        expiresDateMs: ent.expiresDateMs,
+        isActive: true,
+        isTrial: false,
+        verifiedAt: new Date(),
+      },
+    },
+    { upsert: true, new: true },
+  );
+
+  return getSubscriptionStatus(userId);
 }

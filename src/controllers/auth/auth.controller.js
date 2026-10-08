@@ -1,11 +1,16 @@
 import { z } from 'zod';
 import { User } from '../../models/User.js';
+import { Plantation } from '../../models/Plantation.js';
 import {
   sendOtp,
   verifyOtp as checkOtpCode,
   currentOtpProvider,
 } from '../../services/otp.service.js';
 import { issueTokens, verifyRefresh } from '../../services/jwt.service.js';
+import {
+  restoreAccount,
+  scheduleDeletion,
+} from '../../services/account-deletion.service.js';
 
 // ---------- validation schemas ----------
 
@@ -91,6 +96,12 @@ export async function verify(req, res, next) {
 
     let user = await User.findOne({ phone });
     let isNewUser = false;
+    // Signing in during the 30-day deletion window cancels the deletion.
+    let restored = false;
+    if (user?.deletedAt) {
+      await restoreAccount(user);
+      restored = true;
+    }
     if (!user) {
       if (!fullName) {
         return res.status(400).json({
@@ -111,9 +122,14 @@ export async function verify(req, res, next) {
     await user.save();
 
     const tokens = issueTokens(user);
+    // Route on this, not isNewUser: someone who registered but left the
+    // estate wizard unfinished still needs onboarding when they sign in.
+    const hasPlantation = !!(await Plantation.exists({ ownerId: user._id }));
     res.json({
       ok: true,
       isNewUser,
+      hasPlantation,
+      restored,
       user: user.toPublicJSON(),
       tokens,
     });
@@ -126,7 +142,7 @@ export async function verify(req, res, next) {
 export async function me(req, res, next) {
   try {
     const user = await User.findById(req.user.sub);
-    if (!user) {
+    if (!user || user.deletedAt) {
       return res.status(401).json({ error: 'unknown_user' });
     }
     res.json({ ok: true, user: user.toPublicJSON() });
@@ -141,11 +157,24 @@ export async function refresh(req, res, next) {
     const { refresh: refreshToken } = refreshSchema.parse(req.body);
     const decoded = verifyRefresh(refreshToken);
     const user = await User.findById(decoded.sub);
-    if (!user) {
+    if (!user || user.deletedAt) {
       return res.status(401).json({ error: 'unknown_user' });
     }
     const tokens = issueTokens(user);
     res.json({ ok: true, tokens });
+  } catch (err) {
+    next(toHttpError(err));
+  }
+}
+
+// Delete account — brief §10.4. Soft delete now; all data is permanently
+// removed after 30 days unless the user signs in again before then.
+export async function deleteAccount(req, res, next) {
+  try {
+    const user = await User.findById(req.user.sub);
+    if (!user) return res.status(401).json({ error: 'unknown_user' });
+    const deleteAfter = await scheduleDeletion(user);
+    res.json({ ok: true, deleteAfter });
   } catch (err) {
     next(toHttpError(err));
   }

@@ -6,7 +6,7 @@ const { Schema } = mongoose;
  * Subscription purchase record.
  * Tracks App Store purchases for Pro plan subscriptions.
  *
- * plan_type: 'yearly' (₹4,200/year) or 'monthly' (₹399/month)
+ * Pro is a single yearly plan: mce_pro_yearly, ₹4,200/year (brief §5.5.3).
  */
 const subscriptionSchema = new Schema(
   {
@@ -23,16 +23,18 @@ const subscriptionSchema = new Schema(
     },
     productId: {
       type: String,
-      enum: ['mce_pro_yearly', 'mce_pro_monthly'],
+      enum: ['mce_pro_yearly'],
       required: true,
     },
     purchaseToken: {
       type: String,
       required: true,
     },
+    /** One store purchase links to one account (see verifySubscription). */
     originalTransactionId: {
       type: String,
-      index: true,
+      unique: true,
+      sparse: true,
     },
     purchaseDateMs: {
       type: Number,
@@ -63,6 +65,5 @@ const subscriptionSchema = new Schema(
 );
 
 subscriptionSchema.index({ userId: 1, isActive: 1 });
-subscriptionSchema.index({ originalTransactionId: 1 });
 
 export const Subscription = mongoose.model('Subscription', subscriptionSchema);

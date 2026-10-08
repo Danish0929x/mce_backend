@@ -35,6 +35,13 @@ const userSchema = new Schema(
     role: { type: String, enum: ['planter', 'admin'], default: 'planter' },
     razorpayCustomerId: { type: String, default: null },
     lastLoginAt: { type: Date, default: null },
+    /**
+     * Account deletion (brief §10.4): set when the user deletes their
+     * account; data is hard-deleted after `deleteAfter` (30 days) unless
+     * they sign in again first.
+     */
+    deletedAt: { type: Date, default: null },
+    deleteAfter: { type: Date, default: null, index: true },
   },
   { timestamps: true },
 );

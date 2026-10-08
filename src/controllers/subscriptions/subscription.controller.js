@@ -1,90 +1,51 @@
+import { z } from 'zod';
 import {
-  verifySubscription,
   getSubscriptionStatus,
-  syncSubscriptionStatus,
+  verifySubscription,
 } from '../../services/subscription.service.js';
+
+const verifySchema = z
+  .object({
+    platform: z.enum(['ios', 'android']),
+    productId: z.string().min(1),
+    // Android: Play purchase token. iOS: optional (receipt), unused.
+    purchaseToken: z.string().min(1).optional(),
+    // iOS: StoreKit transaction ID (PurchaseDetails.purchaseID).
+    transactionId: z.string().min(1).optional(),
+  })
+  .refine((v) => (v.platform === 'ios' ? !!v.transactionId : !!v.purchaseToken), {
+    message: 'iOS needs transactionId; Android needs purchaseToken.',
+  });
 
 /**
  * POST /api/v1/subscriptions/verify
- * Verify and activate a purchase from App Store.
+ * Verify a store purchase server-side and activate Pro.
  */
-export async function handleVerifySubscription(req, res) {
+export async function handleVerifySubscription(req, res, next) {
   try {
-    const { platform, productId, purchaseToken } = req.body;
-    const userId = req.user.id; // From auth middleware
-
-    if (!platform || !productId || !purchaseToken) {
-      return res.status(400).json({
-        error: 'Missing required fields: platform, productId, purchaseToken',
-      });
+    const body = verifySchema.parse(req.body);
+    const status = await verifySubscription(req.user.sub, body);
+    res.json({ success: true, data: status });
+  } catch (err) {
+    if (err?.name === 'ZodError') {
+      err.status = 400;
+      err.code = 'validation_error';
     }
-
-    if (!['ios', 'android'].includes(platform)) {
-      return res.status(400).json({ error: 'Invalid platform' });
-    }
-
-    const result = await verifySubscription(userId, platform, productId, purchaseToken);
-
-    res.status(200).json({
-      success: true,
-      data: {
-        plan: result.plan,
-        expiresAt: result.expiresAt,
-      },
-    });
-  } catch (error) {
-    console.error('Verify subscription error:', error);
-    res.status(500).json({
-      error: error.message || 'Failed to verify subscription',
-    });
+    next(err);
   }
 }
 
 /**
- * GET /api/v1/subscriptions/status
- * Get current subscription status for the authenticated user.
+ * GET /api/v1/subscriptions/status — effective plan + entitlements.
+ * POST /api/v1/subscriptions/sync — same; kept for older app builds.
  */
-export async function handleGetSubscriptionStatus(req, res) {
+export async function handleGetSubscriptionStatus(req, res, next) {
   try {
-    const userId = req.user.id;
-
-    // Sync subscription status before returning
-    await syncSubscriptionStatus(userId);
-
-    const status = await getSubscriptionStatus(userId);
-
-    res.status(200).json({
-      success: true,
-      data: status,
-    });
-  } catch (error) {
-    console.error('Get subscription status error:', error);
-    res.status(500).json({
-      error: error.message || 'Failed to get subscription status',
-    });
+    const status = await getSubscriptionStatus(req.user.sub);
+    res.json({ success: true, data: status });
+  } catch (err) {
+    next(err);
   }
 }
 
-/**
- * POST /api/v1/subscriptions/sync
- * Manually sync subscription status (check for expiration, etc).
- */
-export async function handleSyncSubscription(req, res) {
-  try {
-    const userId = req.user.id;
-
-    await syncSubscriptionStatus(userId);
-
-    const status = await getSubscriptionStatus(userId);
-
-    res.status(200).json({
-      success: true,
-      data: status,
-    });
-  } catch (error) {
-    console.error('Sync subscription error:', error);
-    res.status(500).json({
-      error: error.message || 'Failed to sync subscription',
-    });
-  }
-}
+export const handleSyncSubscription = handleGetSubscriptionStatus;

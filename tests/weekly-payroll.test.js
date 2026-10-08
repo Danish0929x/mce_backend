@@ -120,3 +120,18 @@ test('temp workers are never flagged — they do not use circulars', async () =>
   assert.equal(r.missingPeriodDays, 0);
   assert.equal(r.totalPaise, 50000);
 });
+
+test('festival days before the joining date are not paid', async () => {
+  // Joins Wed 15 Apr 2026; festivals on Mon 13 (before) and Fri 17 (after).
+  const r = await calculateWeeklyPayroll({
+    worker: { ...unionWorker, joinedAt: day('2026-04-15') },
+    attendance: [],
+    weekStart: day('2026-04-13'),
+    festivalDatesInWeek: [
+      { date: day('2026-04-13'), label: 'Before joining' },
+      { date: day('2026-04-17'), label: 'After joining' },
+    ],
+  });
+  assert.equal(r.festivalDays, 1);
+  assert.equal(r.totalPaise, 42121 + 15155); // one day of Basic + DA, 0 yrs → no weightage
+});

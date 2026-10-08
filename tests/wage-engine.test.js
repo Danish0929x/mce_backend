@@ -6,6 +6,7 @@ import {
   tenureYearsAt,
   calculateUnionDailyWage,
   calculateTempDailyWage,
+  tempRateOn,
 } from '../src/services/wage-engine.service.js';
 import { formatRupees } from '../src/utils/money.js';
 
@@ -168,4 +169,34 @@ test('festival pay formula: Basic + DA + weightage, no allowances', () => {
   const expected = basicPaise + daPaise + weightage;
   assert.equal(expected, 57506);
   assert.equal(formatRupees(expected), '₹575.06');
+});
+
+// ---------- temp rate history ----------
+
+test('temp rate change applies from its effective date only', () => {
+  const worker = {
+    tempPayType: 'daily',
+    tempRatePaise: 60000,
+    tempRateHistory: [
+      { effectiveFrom: new Date('2026-01-01T00:00:00.000Z'), ratePaise: 50000 },
+      { effectiveFrom: new Date('2026-04-15T00:00:00.000Z'), ratePaise: 60000 },
+    ],
+  };
+  const pay = (date) =>
+    calculateTempDailyWage({
+      worker,
+      workDate: new Date(`${date}T00:00:00.000Z`),
+      attendance: { isPresent: true, hoursWorked: 8 },
+    }).totalPaise;
+
+  assert.equal(pay('2026-04-14'), 50000); // before the change: old rate
+  assert.equal(pay('2026-04-15'), 60000); // from the change date: new rate
+  assert.equal(pay('2025-12-01'), 50000); // before history: earliest rate
+});
+
+test('temp worker without history uses tempRatePaise', () => {
+  assert.equal(
+    tempRateOn({ tempRatePaise: 45000 }, new Date('2026-04-15T00:00:00.000Z')),
+    45000,
+  );
 });

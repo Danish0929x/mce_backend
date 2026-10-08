@@ -3,6 +3,9 @@ import { z } from 'zod';
 import { Plantation } from '../../models/Plantation.js';
 import { Plot } from '../../models/Plot.js';
 import { Worker } from '../../models/Worker.js';
+import { FertilizerSchedule } from '../../models/FertilizerSchedule.js';
+import { ApplicationLog } from '../../models/ApplicationLog.js';
+import { DiagnosisScan } from '../../models/DiagnosisScan.js';
 import { rupeesToPaise } from '../../utils/money.js';
 import { zDateOnly } from '../../utils/dates.js';
 import {
@@ -177,6 +180,163 @@ export async function mine(req, res, next) {
       plots: plots.map((p) => p.toPublicJSON()),
       workers: workers.map((w) => w.toPublicJSON()),
     });
+  } catch (err) {
+    next(toHttpError(err));
+  }
+}
+
+// ---------- estate + plot editing (brief §5.5.1) ----------
+
+const updatePlantationSchema = z
+  .object({
+    name: z.string().trim().min(2).max(120).optional(),
+    district: z.string().trim().min(2).max(60).optional(),
+    totalAcres: z.number().positive().max(10_000).optional(),
+    primaryCrop: z.string().trim().min(2).max(40).optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, {
+    message: 'Provide at least one field to update.',
+  });
+
+const updatePlotSchema = plotSchema
+  .partial()
+  .refine((v) => Object.keys(v).length > 0, {
+    message: 'Provide at least one field to update.',
+  });
+
+async function callerPlantationOr404(req, res) {
+  const p = await Plantation.findOne({ ownerId: req.user.sub });
+  if (!p) {
+    res.status(404).json({
+      error: 'no_plantation',
+      message: 'No estate registered yet. Complete onboarding first.',
+    });
+  }
+  return p;
+}
+
+/** Sum of plot acreage, optionally replacing one plot's acres. */
+async function plotAcreage(plantationId, { replaceId = null, replaceAcres = 0 } = {}) {
+  const plots = await Plot.find({ plantationId });
+  return plots.reduce(
+    (sum, p) =>
+      sum + (replaceId && p._id.equals(replaceId) ? replaceAcres : p.acres),
+    0,
+  );
+}
+
+function plotsExceedTotal(res, assigned, total) {
+  return res.status(400).json({
+    error: 'plots_exceed_total',
+    message:
+      `Plot acreage (${+assigned.toFixed(2)}) would exceed the estate total ` +
+      `(${total}). Adjust the plots or the total first.`,
+  });
+}
+
+// PATCH /plantations/mine — edit estate details.
+export async function updateMine(req, res, next) {
+  try {
+    const body = updatePlantationSchema.parse(req.body);
+    const p = await callerPlantationOr404(req, res);
+    if (!p) return;
+
+    if (body.totalAcres !== undefined) {
+      const assigned = await plotAcreage(p._id);
+      if (assigned - body.totalAcres > 0.0001) {
+        return plotsExceedTotal(res, assigned, body.totalAcres);
+      }
+    }
+    Object.assign(p, body);
+    await p.save();
+    res.json({ ok: true, plantation: p.toPublicJSON() });
+  } catch (err) {
+    next(toHttpError(err));
+  }
+}
+
+// POST /plantations/mine/plots — add a plot.
+export async function addPlot(req, res, next) {
+  try {
+    const body = plotSchema.parse(req.body);
+    const p = await callerPlantationOr404(req, res);
+    if (!p) return;
+
+    const assigned = (await plotAcreage(p._id)) + body.acres;
+    if (assigned - p.totalAcres > 0.0001) {
+      return plotsExceedTotal(res, assigned, p.totalAcres);
+    }
+    const plot = await Plot.create({
+      plantationId: p._id,
+      name: body.name,
+      acres: body.acres,
+      soilType: body.soilType ?? null,
+    });
+    res.status(201).json({ ok: true, plot: plot.toPublicJSON() });
+  } catch (err) {
+    next(toHttpError(err));
+  }
+}
+
+// PATCH /plantations/mine/plots/:id — rename / resize a plot.
+export async function updatePlot(req, res, next) {
+  try {
+    const body = updatePlotSchema.parse(req.body);
+    const p = await callerPlantationOr404(req, res);
+    if (!p) return;
+    const plot = await Plot.findOne({ _id: req.params.id, plantationId: p._id });
+    if (!plot) return res.status(404).json({ error: 'plot_not_found' });
+
+    if (body.acres !== undefined) {
+      const assigned = await plotAcreage(p._id, {
+        replaceId: plot._id,
+        replaceAcres: body.acres,
+      });
+      if (assigned - p.totalAcres > 0.0001) {
+        return plotsExceedTotal(res, assigned, p.totalAcres);
+      }
+    }
+    if (body.name !== undefined) plot.name = body.name;
+    if (body.acres !== undefined) plot.acres = body.acres;
+    if (body.soilType !== undefined) plot.soilType = body.soilType ?? null;
+    await plot.save();
+    res.json({ ok: true, plot: plot.toPublicJSON() });
+  } catch (err) {
+    next(toHttpError(err));
+  }
+}
+
+// DELETE /plantations/mine/plots/:id — only for plots nothing refers to,
+// so schedules, application history and scans never lose their plot.
+export async function deletePlot(req, res, next) {
+  try {
+    const p = await callerPlantationOr404(req, res);
+    if (!p) return;
+    const plot = await Plot.findOne({ _id: req.params.id, plantationId: p._id });
+    if (!plot) return res.status(404).json({ error: 'plot_not_found' });
+
+    if ((await Plot.countDocuments({ plantationId: p._id })) <= 1) {
+      return res.status(409).json({
+        error: 'last_plot',
+        message: 'An estate needs at least one plot.',
+      });
+    }
+    const [schedules, logs, scans] = await Promise.all([
+      FertilizerSchedule.countDocuments({ plotId: plot._id }),
+      ApplicationLog.countDocuments({ plotId: plot._id }),
+      DiagnosisScan.countDocuments({ plotId: plot._id }),
+    ]);
+    if (schedules + logs + scans > 0) {
+      return res.status(409).json({
+        error: 'plot_in_use',
+        message:
+          `${plot.name} is used by ${schedules} scheduled application(s), ` +
+          `${logs} application record(s) and ${scans} scan(s), so it can't be ` +
+          'deleted. You can rename it or change its acreage instead.',
+      });
+    }
+    await plot.deleteOne();
+    res.json({ ok: true });
   } catch (err) {
     next(toHttpError(err));
   }

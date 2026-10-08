@@ -12,6 +12,7 @@ import { StockPurchase } from '../../models/StockPurchase.js';
 import { SupplyLog } from '../../models/SupplyLog.js';
 import { WagePeriod } from '../../models/WagePeriod.js';
 import { calculateWeeklyPayroll } from '../../services/wage-engine.service.js';
+import { getEntitlements } from '../../services/subscription.service.js';
 import {
   addDays,
   daysBetween,
@@ -259,9 +260,10 @@ export async function dashboard(req, res, next) {
         today,
       }),
       inventory: await buildInventorySnapshot(inventoryRows),
+      // Effective plan (trial ends and subscriptions lapse by date).
       trial: {
         endsAt: user.trialEndsAt,
-        plan: user.plan,
+        plan: (await getEntitlements(req.user.sub)).plan,
       },
     });
   } catch (err) {

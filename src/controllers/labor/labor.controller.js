@@ -25,9 +25,14 @@ import {
 } from '../../utils/dates.js';
 import {
   calculateWeeklyPayroll,
+  tempRateOn,
   weightagePaise,
 } from '../../services/wage-engine.service.js';
-import { calculateYearEndSettlement } from '../../services/settlement.service.js';
+import {
+  calculateYearEndSettlement,
+  settlementYearRange,
+} from '../../services/settlement.service.js';
+import { getEntitlements } from '../../services/subscription.service.js';
 
 // ---------- helpers ----------
 
@@ -41,6 +46,67 @@ function queryDateOr(value, fallback) {
 async function getCallerPlantation(req) {
   const p = await Plantation.findOne({ ownerId: req.user.sub });
   return p;
+}
+
+/**
+ * Workers to include for [from]–[to]: active ones plus any deactivated
+ * worker who has attendance or paid payroll in the range, so wages owed or
+ * already paid never drop out of payroll or settlement on deactivation.
+ */
+async function workersForRange(plantationId, from, to, filter = {}) {
+  const [attendedIds, paidIds] = await Promise.all([
+    Attendance.distinct('workerId', {
+      plantationId,
+      workDate: { $gte: from, $lte: to },
+      isPresent: true,
+    }),
+    PayrollWeek.distinct('workerId', {
+      plantationId,
+      weekStart: { $gte: from, $lte: to },
+    }),
+  ]);
+  return Worker.find({
+    plantationId,
+    ...filter,
+    $or: [{ active: true }, { _id: { $in: [...attendedIds, ...paidIds] } }],
+  }).sort({ createdAt: 1 });
+}
+
+/** The paid PayrollWeek of the week containing [date], or null. */
+function paidWeekContaining(workerId, date) {
+  return PayrollWeek.findOne({
+    workerId,
+    weekStart: startOfWeekMonday(date),
+    paidAt: { $ne: null },
+  });
+}
+
+/**
+ * 403 response if the caller's plan can't take [adding] more active
+ * workers (free plan: 5), else null. Brief §5.5.3.
+ */
+async function workerLimitResponse(req, res, plantationId, adding = 1) {
+  const { entitlements } = await getEntitlements(req.user.sub);
+  const limit = entitlements.workerLimit;
+  if (limit == null) return null;
+  const active = await Worker.countDocuments({ plantationId, active: true });
+  if (active + adding <= limit) return null;
+  return res.status(403).json({
+    error: 'plan_limit',
+    message:
+      `The free plan allows up to ${limit} active workers. ` +
+      'Upgrade to Pro to add more.',
+  });
+}
+
+/** 409 for writes that would change a week that is already paid. */
+function weekPaidResponse(res, what) {
+  return res.status(409).json({
+    error: 'week_paid',
+    message:
+      `This week's payroll is already marked paid, so ${what} can no longer ` +
+      'be changed for it.',
+  });
 }
 
 function toHttpError(err) {
@@ -72,6 +138,9 @@ export async function listWorkers(req, res, next) {
 }
 
 const createWorkerSchema = z.object({
+  // Set by the app for workers added offline, so attendance queued for
+  // them right after can reference the worker before it syncs.
+  id: z.string().regex(/^[0-9a-f]{24}$/).optional(),
   fullName: z.string().trim().min(2).max(120),
   type: z.enum(['union', 'temp']),
   phone: z.string().regex(/^\+91\d{10}$/).optional().nullable(),
@@ -86,6 +155,20 @@ export async function createWorker(req, res, next) {
     const p = await getCallerPlantation(req);
     if (!p) return res.status(404).json({ error: 'no_plantation' });
 
+    // Offline replay: the worker was already created by an earlier attempt.
+    if (body.id) {
+      const existing = await Worker.findById(body.id);
+      if (existing) {
+        if (!existing.plantationId.equals(p._id)) {
+          return res.status(409).json({ error: 'id_conflict' });
+        }
+        return res.json({ ok: true, worker: existing.toPublicJSON() });
+      }
+    }
+
+    const limited = await workerLimitResponse(req, res, p._id);
+    if (limited) return limited;
+
     if (body.type === 'temp') {
       if (!body.tempPayType || !body.tempRateRupees) {
         return res.status(400).json({
@@ -96,6 +179,7 @@ export async function createWorker(req, res, next) {
     }
 
     const w = await Worker.create({
+      ...(body.id ? { _id: body.id } : {}),
       plantationId: p._id,
       fullName: body.fullName,
       type: body.type,
@@ -149,6 +233,13 @@ export async function bulkImportWorkers(req, res, next) {
     const { csv } = bulkImportBodySchema.parse(req.body);
     const p = await getCallerPlantation(req);
     if (!p) return res.status(404).json({ error: 'no_plantation' });
+    const { entitlements } = await getEntitlements(req.user.sub);
+    if (!entitlements.canBulkImport) {
+      return res.status(403).json({
+        error: 'pro_required',
+        message: 'CSV import is a Pro feature. Upgrade to Pro to import workers.',
+      });
+    }
 
     let rawRows;
     try {
@@ -270,7 +361,9 @@ const updateWorkerSchema = z
     fullName: z.string().trim().min(2).max(120).optional(),
     phone: z.string().regex(/^\+91\d{10}$/).nullable().optional(),
     joinedAt: zDateOnly.optional(),
-    tempRateRupees: z.number().positive().nullable().optional(),
+    tempRateRupees: z.number().positive().optional(),
+    /** When a new temp rate starts applying (defaults to today). */
+    tempRateEffectiveFrom: zDateOnly.optional(),
     active: z.boolean().optional(),
   })
   .refine((v) => Object.keys(v).length > 0, {
@@ -285,15 +378,28 @@ export async function updateWorker(req, res, next) {
     const w = await Worker.findOne({ _id: req.params.id, plantationId: p._id });
     if (!w) return res.status(404).json({ error: 'worker_not_found' });
 
+    if (body.active === true && !w.active) {
+      const limited = await workerLimitResponse(req, res, p._id);
+      if (limited) return limited;
+    }
+
     if (body.fullName !== undefined) w.fullName = body.fullName;
     if (body.phone !== undefined) w.phone = body.phone;
     if (body.joinedAt !== undefined) w.joinedAt = body.joinedAt;
     if (body.active !== undefined) w.active = body.active;
     if (body.tempRateRupees !== undefined && w.type === 'temp') {
-      w.tempRatePaise =
-        body.tempRateRupees == null
-          ? null
-          : rupeesToPaise(String(body.tempRateRupees));
+      const ratePaise = rupeesToPaise(String(body.tempRateRupees));
+      const from = body.tempRateEffectiveFrom ?? todayIST();
+      const history = w.tempRateHistory?.length
+        ? w.tempRateHistory.map((h) => h.toObject?.() ?? h)
+        : [{ effectiveFrom: w.joinedAt, ratePaise: w.tempRatePaise }];
+      // The new rate replaces anything already scheduled from that date on;
+      // days before it keep the rate they were worked at.
+      w.tempRateHistory = [
+        ...history.filter((h) => h.effectiveFrom < from),
+        { effectiveFrom: from, ratePaise },
+      ];
+      w.tempRatePaise = tempRateOn(w, todayIST());
     }
     await w.save();
     res.json({ ok: true, worker: w.toPublicJSON() });
@@ -314,7 +420,16 @@ const attendanceUpsertSchema = z.object({
   sprayingFlag: z.boolean().optional(),
   shadeFlag: z.boolean().optional(),
   notes: z.string().trim().max(500).optional(),
-});
+}).refine(
+  (v) =>
+    !v.isPresent ||
+    v.hoursWorked == null ||
+    (v.hoursWorked >= 0.5 && v.hoursWorked <= 16 && (v.hoursWorked * 2) % 1 === 0),
+  {
+    path: ['hoursWorked'],
+    message: 'Hours must be 0.5–16 in steps of 0.5 when present.',
+  },
+);
 
 /** GET /labor/attendance?date=YYYY-MM-DD — one row per active worker for that day. */
 export async function getAttendanceByDate(req, res, next) {
@@ -374,6 +489,9 @@ export async function upsertAttendance(req, res, next) {
         message: 'Attendance cannot be marked for a future date.',
       });
     }
+    if (await paidWeekContaining(w._id, workDate)) {
+      return weekPaidResponse(res, 'attendance');
+    }
 
     const row = await Attendance.findOneAndUpdate(
       { workerId: w._id, workDate },
@@ -418,7 +536,7 @@ export async function getWeeklyPayroll(req, res, next) {
     const weekStart = startOfWeekMonday(queryDateOr(req.query.start, today));
     const weekEnd = endOfDay(addDays(weekStart, 6));
 
-    const workers = await Worker.find({ plantationId: p._id, active: true });
+    const workers = await workersForRange(p._id, weekStart, weekEnd);
 
     // Pull a single attendance snapshot once and pass per-worker filtered slices.
     const allAttendance = await Attendance.find({
@@ -454,7 +572,12 @@ export async function getWeeklyPayroll(req, res, next) {
       const bonusPaise = bonusByWorker.get(wId) ?? 0;
       const paid = paidByWorker.get(wId);
       if (paid && paid.paidAt) {
-        // Use the frozen snapshot — payroll is immutable once paid.
+        // Use the frozen snapshot — payroll is immutable once paid. Its
+        // totalPaise already includes the bonuses frozen at payment time.
+        const paidBonusPaise =
+          paid.bonusPaise ?? 0;
+        const paidBasePaise =
+          paid.basePayPaise ?? paid.totalPaise - paidBonusPaise;
         breakdowns.push({
           worker: w.toPublicJSON(),
           weekStart: paid.weekStart,
@@ -464,11 +587,11 @@ export async function getWeeklyPayroll(req, res, next) {
           festivalDays: paid.festivalDays,
           totalHours: paid.totalHours,
           avgDailyPaise: paid.daysPresent + paid.festivalDays > 0
-              ? Math.round(paid.totalPaise / (paid.daysPresent + paid.festivalDays))
+              ? Math.round(paidBasePaise / (paid.daysPresent + paid.festivalDays))
               : 0,
-          basePayPaise: paid.totalPaise,
-          bonusPaise,
-          totalPaise: paid.totalPaise + bonusPaise,
+          basePayPaise: paidBasePaise,
+          bonusPaise: paidBonusPaise,
+          totalPaise: paid.totalPaise,
           days: paid.days,
           paidAt: paid.paidAt,
         });
@@ -887,10 +1010,12 @@ export async function getYearEndSettlement(req, res, next) {
     if (!p) return res.status(404).json({ error: 'no_plantation' });
 
     const year = Number(req.query.year) || currentYearIST();
+    const { yearStart, yearEnd } = settlementYearRange(year);
 
-    const workers = await Worker.find({
-      plantationId: p._id,
-      active: true,
+    // Union workers only (CGA rules), including anyone deactivated during
+    // the year who still worked or was paid in it.
+    const workers = await workersForRange(p._id, yearStart, yearEnd, {
+      type: 'union',
     });
 
     const breakdowns = [];
@@ -1144,6 +1269,11 @@ export async function logOneOffBonus(req, res, next) {
     const w = await Worker.findOne({ _id: body.workerId, plantationId: p._id });
     if (!w) return res.status(404).json({ error: 'worker_not_found' });
 
+    // A one-off bonus joins the current week's payroll (brief §5.4.9).
+    if (await paidWeekContaining(w._id, todayIST())) {
+      return weekPaidResponse(res, 'bonuses');
+    }
+
     const doc = await BonusPayment.create({
       plantationId: p._id,
       workerId: w._id,
@@ -1164,13 +1294,17 @@ export async function deleteBonusPayment(req, res, next) {
     const p = await getCallerPlantation(req);
     if (!p) return res.status(404).json({ error: 'no_plantation' });
 
-    const result = await BonusPayment.deleteOne({
+    const payment = await BonusPayment.findOne({
       _id: req.params.id,
       plantationId: p._id,
     });
-    if (result.deletedCount === 0) {
+    if (!payment) {
       return res.status(404).json({ error: 'payment_not_found' });
     }
+    if (await paidWeekContaining(payment.workerId, istDateOnly(payment.paidAt))) {
+      return weekPaidResponse(res, 'bonuses');
+    }
+    await payment.deleteOne();
     res.json({ ok: true });
   } catch (err) {
     next(err);

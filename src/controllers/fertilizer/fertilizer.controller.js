@@ -79,6 +79,9 @@ const markAppliedSchema = z.object({
   scheduleId: z.string().min(8),
   quantityUsedKg: z.number().positive(),
   notes: z.string().trim().max(500).optional(),
+  // When it was actually done — set by the app for offline entries that
+  // sync later. Defaults to now; never in the future.
+  appliedAt: z.string().datetime().optional(),
 });
 
 /**
@@ -126,7 +129,9 @@ export async function markApplied(req, res, next) {
             scheduleId: schedule._id,
             quantityUsedGrams: usedGrams,
             applicationMethod: schedule.applicationMethod,
-            appliedAt: new Date(),
+            appliedAt: body.appliedAt
+              ? new Date(Math.min(Date.parse(body.appliedAt), Date.now()))
+              : new Date(),
             appliedBy: req.user.sub,
           },
         ],
@@ -176,7 +181,24 @@ const logStockSchema = z.object({
   quantityKg: z.number().positive(),
   pricePerKgRupees: z.number().positive(),
   supplier: z.string().trim().max(120).optional().nullable(),
+  // Offline entries: replay-safe id and the time it was logged on the phone.
+  clientRequestId: z.string().min(8).max(64).optional(),
+  purchasedAt: z.string().datetime().optional(),
 });
+
+/** Response for a purchase that was already recorded (offline replay). */
+async function existingPurchaseResponse(res, plantationId, purchase) {
+  const inv = await Inventory.findOne({
+    plantationId,
+    fertilizerId: purchase.fertilizerId,
+  });
+  return res.json({
+    ok: true,
+    duplicate: true,
+    purchase: purchase.toPublicJSON(),
+    inventory: inv?.toPublicJSON() ?? null,
+  });
+}
 
 /**
  * Log a fertilizer stock purchase. Atomically: StockPurchase row +
@@ -202,33 +224,56 @@ export async function logStockPurchase(req, res, next) {
       return res.status(404).json({ error: 'fertilizer_not_found' });
     }
 
+    if (body.clientRequestId) {
+      const already = await StockPurchase.findOne({
+        plantationId,
+        clientRequestId: body.clientRequestId,
+      });
+      if (already) return existingPurchaseResponse(res, plantationId, already);
+    }
+
     const grams = Math.round(body.quantityKg * 1000);
     const pricePerKgPaise = rupeesToPaise(String(body.pricePerKgRupees));
     const totalCostPaise = Math.round((grams / 1000) * pricePerKgPaise);
 
     let purchaseDoc, invDoc;
-    await session.withTransaction(async () => {
-      [purchaseDoc] = await StockPurchase.create(
-        [
-          {
-            plantationId,
-            fertilizerId: fert._id,
-            quantityGrams: grams,
-            pricePerKgPaise,
-            totalCostPaise,
-            supplier: body.supplier ?? null,
-            purchasedAt: new Date(),
-          },
-        ],
-        { session },
-      );
+    try {
+      await session.withTransaction(async () => {
+        [purchaseDoc] = await StockPurchase.create(
+          [
+            {
+              plantationId,
+              fertilizerId: fert._id,
+              quantityGrams: grams,
+              pricePerKgPaise,
+              totalCostPaise,
+              supplier: body.supplier ?? null,
+              purchasedAt: body.purchasedAt
+                ? new Date(Math.min(Date.parse(body.purchasedAt), Date.now()))
+                : new Date(),
+              clientRequestId: body.clientRequestId ?? null,
+            },
+          ],
+          { session },
+        );
 
-      invDoc = await Inventory.findOneAndUpdate(
-        { plantationId, fertilizerId: fert._id },
-        { $inc: { quantityGrams: grams } },
-        { upsert: true, new: true, session },
-      );
-    });
+        invDoc = await Inventory.findOneAndUpdate(
+          { plantationId, fertilizerId: fert._id },
+          { $inc: { quantityGrams: grams } },
+          { upsert: true, new: true, session },
+        );
+      });
+    } catch (err) {
+      // Two copies of the same offline purchase raced: keep the first.
+      if (err?.code === 11000 && body.clientRequestId) {
+        const already = await StockPurchase.findOne({
+          plantationId,
+          clientRequestId: body.clientRequestId,
+        });
+        if (already) return existingPurchaseResponse(res, plantationId, already);
+      }
+      throw err;
+    }
 
     res.status(201).json({
       ok: true,

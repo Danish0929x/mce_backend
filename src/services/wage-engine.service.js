@@ -126,23 +126,40 @@ export function calculateUnionDailyWage({
  * @param {object} args
  * @param {{ tempPayType: 'daily'|'hourly', tempRatePaise: number }} args.worker
  * @param {{ isPresent: boolean, hoursWorked: number }} args.attendance
+ * @param {Date} [args.workDate] - picks the rate in effect that day
  */
-export function calculateTempDailyWage({ worker, attendance }) {
+export function calculateTempDailyWage({ worker, attendance, workDate }) {
+  const ratePaise = tempRateOn(worker, workDate);
   if (!attendance.isPresent) {
-    return { totalPaise: 0, parts: { ratePaise: worker.tempRatePaise } };
+    return { totalPaise: 0, parts: { ratePaise } };
   }
   const totalPaise =
     worker.tempPayType === 'hourly'
-      ? Math.round(worker.tempRatePaise * (attendance.hoursWorked || 0))
-      : worker.tempRatePaise;
+      ? Math.round(ratePaise * (attendance.hoursWorked || 0))
+      : ratePaise;
   return {
     totalPaise,
     parts: {
-      ratePaise: worker.tempRatePaise,
+      ratePaise,
       hoursWorked: attendance.hoursWorked || 0,
       payType: worker.tempPayType,
     },
   };
+}
+
+/**
+ * Temp rate in effect on [date]: the latest history entry starting on or
+ * before it. Falls back to the earliest entry for dates before it, and to
+ * `tempRatePaise` for workers without history.
+ */
+export function tempRateOn(worker, date) {
+  const history = worker.tempRateHistory ?? [];
+  if (!history.length || !date) return worker.tempRatePaise;
+  let rate = history[0].ratePaise;
+  for (const h of history) {
+    if (h.effectiveFrom <= date) rate = h.ratePaise;
+  }
+  return rate;
 }
 
 // ---------- weekly payroll (brief §5.4.4) ----------
@@ -198,7 +215,11 @@ export async function calculateWeeklyPayroll({
     const row = attendance.find((a) => sameDay(a.workDate, workDate));
     const isPresent = row?.isPresent === true;
     const hoursWorked = row?.hoursWorked ?? 0;
-    const festival = festivalByDay.get(_dayKey(workDate));
+    // A festival day is only owed once the worker has joined.
+    const festival =
+      workDate >= istDateOnly(worker.joinedAt)
+        ? festivalByDay.get(_dayKey(workDate))
+        : undefined;
 
     if (isPresent) {
       daysPresent++;
@@ -248,6 +269,7 @@ export async function calculateWeeklyPayroll({
       // Temp workers don't receive festival pay (CGA-only rule).
       dayResult = calculateTempDailyWage({
         worker,
+        workDate,
         attendance: { isPresent, hoursWorked },
       });
     }

@@ -1,6 +1,7 @@
 import { env } from './config/env.js';
 import { connectDb } from './config/db.js';
 import { createApp } from './app.js';
+import { startDeletionPurgeJob } from './services/account-deletion.service.js';
 import {
   seedSystemFertilizers,
   seedAnnualConfig,
@@ -19,6 +20,8 @@ async function bootstrap() {
   console.log(
     `[seed] annual config: ${acResult.upserted ? 'created' : 'exists'} for ${acResult.year}`,
   );
+
+  startDeletionPurgeJob();
 
   const app = createApp();
   app.listen(env.port, () => {
