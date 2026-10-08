@@ -17,6 +17,8 @@ const treatmentSchema = new Schema(
     summary: { type: String, default: '' },
     products: { type: [String], default: [] },
     doseringPerAcre: { type: String, default: '' },
+    /** Total quantity for areaAcres. Absent on scans made before it existed. */
+    doseForArea: { type: String, default: '' },
     schedule: { type: String, default: '' },
   },
   { _id: false },
@@ -68,6 +70,8 @@ const diagnosisScanSchema = new Schema(
     alternatives: { type: [alternativeSchema], default: [] },
     treatment: { type: treatmentSchema, default: () => ({}) },
     advice: { type: String, default: '' },
+    /** Acreage doseForArea was sized for (plot if picked, else whole estate). */
+    areaAcres: { type: Number, default: null },
 
     /** Latency in ms — useful for monitoring. */
     latencyMs: { type: Number, default: 0 },
@@ -98,9 +102,11 @@ diagnosisScanSchema.methods.toPublicJSON = function ({
       summary: this.treatment?.summary ?? '',
       products: this.treatment?.products ?? [],
       doseringPerAcre: this.treatment?.doseringPerAcre ?? '',
+      doseForArea: this.treatment?.doseForArea ?? '',
       schedule: this.treatment?.schedule ?? '',
     },
     advice: this.advice,
+    areaAcres: this.areaAcres ?? null,
     latencyMs: this.latencyMs,
     createdAt: this.createdAt,
     // Image only sent on detail view to keep list payloads small.

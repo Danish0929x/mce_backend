@@ -201,3 +201,22 @@ export async function calculateYearEndSettlement({ worker, year }) {
     periods,
   });
 }
+
+/**
+ * Whether settlement [year] has ended by [today] (date-only, IST) — only
+ * then can it be finalised and locked.
+ */
+export function isSettlementYearOver(year, today, startMonth = settlementStartMonth()) {
+  const { yearEnd } = settlementYearRange(year, startMonth);
+  return today > yearEnd;
+}
+
+/** Roll-up of per-worker settlement rows for the settlement screen header. */
+export function settlementTotals(breakdowns) {
+  const sum = (pick) => breakdowns.reduce((s, b) => s + (pick(b) ?? 0), 0);
+  return {
+    bonusPoolPaise: sum((b) => b.components?.bonusPaise),
+    settlementTotalPaise: sum((b) => b.settlementTotalPaise),
+    grandTotalPaise: sum((b) => b.grandTotalPaise),
+  };
+}

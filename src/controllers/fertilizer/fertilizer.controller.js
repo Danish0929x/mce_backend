@@ -7,13 +7,28 @@ import { Inventory } from '../../models/Inventory.js';
 import { FertilizerSchedule } from '../../models/FertilizerSchedule.js';
 import { ApplicationLog } from '../../models/ApplicationLog.js';
 import { StockPurchase } from '../../models/StockPurchase.js';
+import { User } from '../../models/User.js';
 import { rupeesToPaise } from '../../utils/money.js';
+import { istDateOnly } from '../../utils/dates.js';
+import {
+  computeSeasonCost,
+  dueCutoff,
+  exactNameRegex,
+  formatDayLabel,
+  initialsOf,
+  isDueForApplication,
+  seasonBounds,
+} from '../../services/fertilizer.service.js';
+
+/** Most application-log rows returned by the overview (≈ a full season). */
+const APPLICATION_LOG_CAP = 1000;
 
 /**
  * Composite read for the Fertilizer / Schedule screen. Returns everything
  * the 3 tabs need in a single round trip:
  *   - upcoming     (status in ['upcoming', 'due'])
- *   - applicationLog (recent completed apps, newest first)
+ *   - applicationLog (completed apps, newest first — up to 1000, i.e. the
+ *                     whole season; each row carries appliedByName/Initials)
  *   - inventory    (one row per fertilizer)
  *   - fertilizers  (lookup table for names)
  *   - plots        (lookup table for plot names)
@@ -33,14 +48,12 @@ export async function fertilizerOverview(req, res, next) {
     const plantationId = plantation._id;
 
     // Promote due upcoming items so the status badge is accurate. Done
-    // server-side at every read; no cron job needed.
-    const today = new Date();
-    today.setUTCHours(23, 59, 59, 999);
+    // server-side at every read; no cron job needed. "Today" is the IST day.
     await FertilizerSchedule.updateMany(
       {
         plantationId,
         status: 'upcoming',
-        scheduledDate: { $lte: today },
+        scheduledDate: { $lt: dueCutoff() },
       },
       { $set: { status: 'due' } },
     );
@@ -50,7 +63,9 @@ export async function fertilizerOverview(req, res, next) {
         plantationId,
         status: { $in: ['upcoming', 'due'] },
       }).sort({ scheduledDate: 1 }),
-      ApplicationLog.find({ plantationId }).sort({ appliedAt: -1 }).limit(50),
+      ApplicationLog.find({ plantationId })
+        .sort({ appliedAt: -1 })
+        .limit(APPLICATION_LOG_CAP),
       Inventory.find({ plantationId }),
       Fertilizer.find({
         $or: [{ plantationId: null }, { plantationId }],
@@ -58,10 +73,26 @@ export async function fertilizerOverview(req, res, next) {
       Plot.find({ plantationId }),
     ]);
 
+    // "Applied by" initials for each log row (brief §5.3.4).
+    const userIds = [
+      ...new Set(log.map((l) => l.appliedBy?.toString()).filter(Boolean)),
+    ];
+    const users = userIds.length
+      ? await User.find({ _id: { $in: userIds } }).select('fullName')
+      : [];
+    const nameById = new Map(users.map((u) => [u._id.toString(), u.fullName]));
+
     res.json({
       ok: true,
       upcoming: upcoming.map((s) => s.toPublicJSON()),
-      applicationLog: log.map((l) => l.toPublicJSON()),
+      applicationLog: log.map((l) => {
+        const name = nameById.get(l.appliedBy?.toString()) ?? null;
+        return {
+          ...l.toPublicJSON(),
+          appliedByName: name,
+          appliedByInitials: initialsOf(name),
+        };
+      }),
       inventory: inventory.map((i) => i.toPublicJSON()),
       fertilizers: fertilizers.map((f) => f.toPublicJSON()),
       plots: plots.map((p) => p.toPublicJSON()),
@@ -110,6 +141,14 @@ export async function markApplied(req, res, next) {
       return res.status(409).json({
         error: 'already_completed',
         message: 'This application was already marked as done.',
+      });
+    }
+    // Brief §5.3.2 — only on or after the scheduled IST day.
+    if (!isDueForApplication(schedule.scheduledDate)) {
+      const day = formatDayLabel(istDateOnly(schedule.scheduledDate));
+      return res.status(400).json({
+        error: 'not_due_yet',
+        message: `This application is scheduled for ${day}; it can be marked applied on or after that day.`,
       });
     }
 
@@ -507,12 +546,11 @@ export async function updateScheduleEntry(req, res, next) {
     if (body.applicationMethod !== undefined) doc.applicationMethod = body.applicationMethod;
     if (body.notes !== undefined) doc.notes = body.notes;
 
-    // Re-promote due/upcoming based on the new date.
-    const today = new Date();
-    today.setUTCHours(23, 59, 59, 999);
-    if (doc.status === 'upcoming' && doc.scheduledDate <= today) {
+    // Re-promote due/upcoming based on the new date (IST day).
+    const isDue = isDueForApplication(doc.scheduledDate);
+    if (doc.status === 'upcoming' && isDue) {
       doc.status = 'due';
-    } else if (doc.status === 'due' && doc.scheduledDate > today) {
+    } else if (doc.status === 'due' && !isDue) {
       doc.status = 'upcoming';
     }
 
@@ -546,6 +584,115 @@ export async function skipScheduleEntry(req, res, next) {
     doc.status = 'skipped';
     await doc.save();
     res.json({ ok: true, schedule: doc.toPublicJSON() });
+  } catch (err) {
+    next(toHttpError(err));
+  }
+}
+
+// ============================================================
+// SEASON COST + CUSTOM FERTILIZERS
+// ============================================================
+
+/**
+ * Season cost summary card — brief §5.3.3. Season = current IST calendar
+ * year. Maths lives in computeSeasonCost (pure, unit-tested).
+ */
+export async function seasonCost(req, res, next) {
+  try {
+    const plantation = await Plantation.findOne({ ownerId: req.user.sub });
+    if (!plantation) {
+      return res.status(404).json({ error: 'no_plantation' });
+    }
+    const plantationId = plantation._id;
+    const { instantRange } = seasonBounds();
+
+    const [purchases, latestPrices, schedules, inventory] = await Promise.all([
+      StockPurchase.find({
+        plantationId,
+        purchasedAt: instantRange,
+        totalCostPaise: { $gt: 0 },
+      }).select('fertilizerId totalCostPaise pricePerKgPaise purchasedAt'),
+      // Latest priced purchase per fertilizer, any season.
+      StockPurchase.aggregate([
+        { $match: { plantationId, pricePerKgPaise: { $gt: 0 } } },
+        { $sort: { purchasedAt: -1 } },
+        {
+          $group: {
+            _id: '$fertilizerId',
+            pricePerKgPaise: { $first: '$pricePerKgPaise' },
+          },
+        },
+      ]),
+      FertilizerSchedule.find({
+        plantationId,
+        status: { $in: ['upcoming', 'due'] },
+      }).select('fertilizerId scheduledDate totalQuantityKg status'),
+      Inventory.find({ plantationId }).select('fertilizerId quantityGrams'),
+    ]);
+
+    const summary = computeSeasonCost({
+      purchases,
+      latestPricePaise: new Map(
+        latestPrices.map((p) => [p._id.toString(), p.pricePerKgPaise]),
+      ),
+      schedules,
+      inventory,
+    });
+    res.json({ ok: true, ...summary });
+  } catch (err) {
+    next(err);
+  }
+}
+
+const createFertilizerSchema = z.object({
+  name: z.string().trim().min(2).max(80),
+  nutrientType: z.enum([
+    'nitrogen',
+    'phosphorus',
+    'potassium',
+    'compound',
+    'micronutrient',
+    'organic',
+    'soil-amendment',
+  ]),
+  form: z.enum(['granular', 'powder', 'liquid']).optional(),
+  defaultPerAcreKg: z.number().positive().max(10000).optional().nullable(),
+  description: z.string().trim().max(200).optional(),
+});
+
+/**
+ * Add a custom fertilizer, visible only to this plantation (brief §4.3).
+ * Names must be unique (case-insensitive) across the plantation's own
+ * fertilizers and the system list.
+ */
+export async function createCustomFertilizer(req, res, next) {
+  try {
+    const body = createFertilizerSchema.parse(req.body);
+    const plantation = await Plantation.findOne({ ownerId: req.user.sub });
+    if (!plantation) {
+      return res.status(404).json({ error: 'no_plantation' });
+    }
+
+    const clash = await Fertilizer.findOne({
+      name: exactNameRegex(body.name),
+      $or: [{ plantationId: null }, { plantationId: plantation._id }],
+    });
+    if (clash) {
+      return res.status(409).json({
+        error: 'duplicate_fertilizer',
+        message: `A fertilizer called "${clash.name}" already exists.`,
+      });
+    }
+
+    const fert = await Fertilizer.create({
+      plantationId: plantation._id,
+      name: body.name,
+      nutrientType: body.nutrientType,
+      form: body.form ?? 'granular',
+      defaultPerAcreKg: body.defaultPerAcreKg ?? null,
+      description: body.description ?? '',
+    });
+    res.status(201).json({ ok: true, fertilizer: fert.toPublicJSON() });
   } catch (err) {
     next(toHttpError(err));
   }

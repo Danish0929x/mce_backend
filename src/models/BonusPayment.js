@@ -32,8 +32,19 @@ const bonusPaymentSchema = new Schema(
     amountPaise: { type: Number, required: true, min: 0 },
     reason: { type: String, default: '' },
     paidAt: { type: Date, default: () => new Date(), index: true },
+    /**
+     * Rule firings only — identifies the occurrence so it is paid once:
+     * `${ruleId}:${workerId}:${year}` (festive) or `${ruleId}:${workerId}`
+     * (tenure milestone). Null for one-off bonuses.
+     */
+    occurrenceKey: { type: String, default: null },
   },
   { timestamps: true },
+);
+
+bonusPaymentSchema.index(
+  { plantationId: 1, occurrenceKey: 1 },
+  { unique: true, partialFilterExpression: { occurrenceKey: { $type: 'string' } } },
 );
 
 bonusPaymentSchema.methods.toPublicJSON = function () {

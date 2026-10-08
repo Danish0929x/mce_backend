@@ -24,7 +24,10 @@ import { env } from '../config/env.js';
  * @property {'mild'|'moderate'|'severe'|'unknown'} severity
  * @property {boolean} isHealthy
  * @property {Array<{name: string, confidence: number}>} alternatives
- * @property {{summary: string, products: string[], doseringPerAcre: string, schedule: string}} treatment
+ * @property {{summary: string, products: string[], doseringPerAcre: string, doseForArea: string, schedule: string}} treatment
+ *   doseForArea — total quantity for the scanned area (whole estate, or the
+ *   plot when one was picked). '' when there's nothing to apply.
+ * @property {number|null} areaAcres        acreage doseForArea was sized for
  * @property {string} advice               planter-friendly paragraph
  * @property {string} provider
  * @property {string} modelUsed
@@ -94,6 +97,33 @@ const MOCK_RESPONSES = [
   },
 ];
 
+/** "1,500" style grouping for scaled quantities; 1 decimal below 10. */
+function formatQty(n) {
+  const rounded = n >= 10 ? Math.round(n) : Math.round(n * 10) / 10;
+  return rounded.toLocaleString('en-IN');
+}
+
+/** "10 acres" / "1 acre" / "2.5 acres". */
+export function formatAcres(acres) {
+  const n = Math.round(acres * 100) / 100;
+  return `${n} ${n === 1 ? 'acre' : 'acres'}`;
+}
+
+/**
+ * Scale a per-acre dose string to [acres] by multiplying every number in it:
+ * "1.5 kg copper oxychloride in 400 L water" × 10 →
+ * "15 kg copper oxychloride in 4,000 L water". Used by the mock provider and
+ * as a fallback when the model leaves doseForArea empty. Percentages
+ * ("Bordeaux mixture 1%") are concentrations, so they're left alone.
+ */
+export function scaleDosePerAcre(perAcre, acres) {
+  if (!perAcre || !(acres > 0)) return '';
+  return perAcre.replace(/(\d+(?:[.,]\d+)*)(?!\s*%)(?![\d.,])/g, (m) => {
+    const n = Number(m.replace(/,/g, ''));
+    return Number.isFinite(n) ? formatQty(n * acres) : m;
+  });
+}
+
 let mockIndex = 0;
 function pickMockResponse() {
   // Deterministic rotation — easier to test than random.
@@ -102,12 +132,17 @@ function pickMockResponse() {
   return r;
 }
 
-async function mockDiagnose() {
+export async function mockDiagnose({ areaAcres = null } = {}) {
   // Simulate network latency.
   await new Promise((resolve) => setTimeout(resolve, 400));
   const base = pickMockResponse();
   return {
     ...base,
+    treatment: {
+      ...base.treatment,
+      doseForArea: scaleDosePerAcre(base.treatment.doseringPerAcre, areaAcres),
+    },
+    areaAcres,
     provider: 'mock',
     modelUsed: 'mock-cardamom-v1',
     rawResponse: { mock: true, note: 'canned response for testing' },
@@ -182,12 +217,23 @@ const DIAGNOSIS_TOOL = {
             type: 'string',
             description: 'Application rate per acre with units.',
           },
+          doseForArea: {
+            type: 'string',
+            description:
+              'Total quantity for the planter\'s area given in the prompt (per-acre rate × acres), with units and water volume, e.g. "15 kg copper oxychloride in 4,000 L water". Empty string if no treatment is needed.',
+          },
           schedule: {
             type: 'string',
             description: 'When and how often to apply.',
           },
         },
-        required: ['summary', 'products', 'doseringPerAcre', 'schedule'],
+        required: [
+          'summary',
+          'products',
+          'doseringPerAcre',
+          'doseForArea',
+          'schedule',
+        ],
       },
       advice: {
         type: 'string',
@@ -218,11 +264,11 @@ When given a photograph of a cardamom leaf, stem, capsule, or rhizome, identify 
 - Nutritional deficiencies (N, Mg, Zn)
 - Sun scorch, mechanical damage
 
-Always call the record_cardamom_diagnosis tool with structured findings. Treatment products should be ones actually available in Kerala (Bordeaux mixture, copper oxychloride, Mancozeb, Tricoderma, Neem cake, etc.). Doses should be realistic per-acre quantities. Advice should be warm, practical, and assume the planter is a working farmer — not a scientist.
+Always call the record_cardamom_diagnosis tool with structured findings. Treatment products should be ones actually available in Kerala (Bordeaux mixture, copper oxychloride, Mancozeb, Tricoderma, Neem cake, etc.). Doses should be realistic per-acre quantities; also give the total quantity for the planter's area (stated in the message) in doseForArea — multiply carefully. Advice should be warm, practical, and assume the planter is a working farmer — not a scientist.
 
 If the image is not of a cardamom plant or is unclear, set topDiagnosis to "Image unclear" with low confidence and ask the planter (in advice) to retake the photo.`;
 
-async function claudeDiagnose({ imageBase64, mime }) {
+async function claudeDiagnose({ imageBase64, mime, areaAcres = null, areaLabel = null }) {
   const t0 = Date.now();
   const model = env.anthropic.diagnosisModel;
   const client = anthropicClient();
@@ -247,7 +293,11 @@ async function claudeDiagnose({ imageBase64, mime }) {
           },
           {
             type: 'text',
-            text: 'Diagnose this cardamom plant image. Call the recording tool with your findings.',
+            text:
+              'Diagnose this cardamom plant image. Call the recording tool with your findings.' +
+              (areaAcres > 0
+                ? ` Size doseForArea for ${areaLabel ?? 'the estate'}: ${formatAcres(areaAcres)}.`
+                : ' The area is unknown, so leave doseForArea empty.'),
           },
         ],
       },
@@ -267,7 +317,14 @@ async function claudeDiagnose({ imageBase64, mime }) {
     severity: data.severity,
     isHealthy: data.isHealthy,
     alternatives: data.alternatives ?? [],
-    treatment: data.treatment,
+    treatment: {
+      ...data.treatment,
+      // Fall back to scaling the per-acre rate if the model skipped it.
+      doseForArea:
+        data.treatment?.doseForArea ||
+        scaleDosePerAcre(data.treatment?.doseringPerAcre, areaAcres),
+    },
+    areaAcres: areaAcres > 0 ? areaAcres : null,
     advice: data.advice,
     provider: 'claude',
     modelUsed: model,
@@ -283,6 +340,8 @@ async function claudeDiagnose({ imageBase64, mime }) {
  * @param {object} args
  * @param {string} args.imageBase64
  * @param {string} args.mime
+ * @param {number|null} [args.areaAcres]  acreage to size doseForArea for
+ * @param {string|null} [args.areaLabel]  e.g. 'plot "North slope"'
  * @returns {Promise<DiagnosisResult>}
  */
 export async function diagnose(args) {
@@ -297,7 +356,7 @@ export async function diagnose(args) {
     }
     return claudeDiagnose(args);
   }
-  return mockDiagnose();
+  return mockDiagnose(args);
 }
 
 export const currentDiagnosisProvider = env.diagnosis.provider;

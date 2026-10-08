@@ -11,8 +11,10 @@ import { BonusPayment } from '../../models/BonusPayment.js';
 import { StockPurchase } from '../../models/StockPurchase.js';
 import { SupplyLog } from '../../models/SupplyLog.js';
 import { WagePeriod } from '../../models/WagePeriod.js';
+import { BonusRule } from '../../models/BonusRule.js';
 import { calculateWeeklyPayroll } from '../../services/wage-engine.service.js';
 import { getEntitlements } from '../../services/subscription.service.js';
+import { formatRupees } from '../../utils/money.js';
 import {
   addDays,
   daysBetween,
@@ -251,14 +253,14 @@ export async function dashboard(req, res, next) {
           supplyPaise: weekSpend.supplyPaise,
         },
       },
-      alerts: await buildAlerts({
+      alerts: capAlerts(await buildAlerts({
         plantationId: plantation._id,
         inventoryRows,
         nextApplication,
         daysUntilNextApplication,
         hasUnionWorkers: unionCount > 0,
         today,
-      }),
+      })),
       inventory: await buildInventorySnapshot(inventoryRows),
       // Effective plan (trial ends and subscriptions lapse by date).
       trial: {
@@ -286,7 +288,8 @@ function firstName(fullName) {
  *   - overdue fertilizer application (red)
  *   - upcoming application within 3 days (brass)
  *   - no CGA wage rate for today (red) / circular ending soon (brass)
- * Bonus alerts come when that module lands.
+ *   - festive bonus due within 7 days (brass)
+ * The dashboard shows at most MAX_DASHBOARD_ALERTS — see capAlerts.
  */
 async function buildAlerts({
   plantationId,
@@ -300,6 +303,7 @@ async function buildAlerts({
 
   // CGA wage period — union pay is ₹0 for any day no circular covers.
   if (hasUnionWorkers) {
+    await WagePeriod.ensureCoversToday(plantationId, today);
     const period = await WagePeriod.activeOn(plantationId, today);
     if (!period) {
       alerts.push({
@@ -364,7 +368,67 @@ async function buildAlerts({
     }
   }
 
+  // Festive bonuses (Onam, Vishu, …) due within the week — cash to arrange.
+  const festiveRules = await BonusRule.find({
+    plantationId,
+    type: 'festive',
+    active: true,
+  });
+  for (const { rule, daysUntil } of upcomingFestiveBonuses(festiveRules, today)) {
+    alerts.push({
+      id: `bonus-due-${rule._id}`,
+      title:
+        daysUntil === 0
+          ? `${rule.name} bonus due today`
+          : `${rule.name} bonus due in ${daysUntil}d`,
+      subtitle: `${formatRupees(rule.amountPaise, { showDecimals: false })}/worker · arrange the cash.`,
+      severity: 'warning',
+      deepLink: '/labor/bonuses',
+    });
+  }
+
   return alerts;
+}
+
+export const MAX_DASHBOARD_ALERTS = 3;
+
+/**
+ * Brief §5.2.1: the strip shows at most 3 alerts, most urgent first. Stable
+ * sort, so the order buildAlerts produced is kept within each severity.
+ */
+export function capAlerts(alerts, max = MAX_DASHBOARD_ALERTS) {
+  const rank = { danger: 0, warning: 1 };
+  return alerts
+    .map((a, i) => ({ a, i }))
+    .sort(
+      (x, y) =>
+        (rank[x.a.severity] ?? 2) - (rank[y.a.severity] ?? 2) || x.i - y.i,
+    )
+    .slice(0, max)
+    .map(({ a }) => a);
+}
+
+/**
+ * Festive rules whose next occurrence (IST, this year or next) is within
+ * [withinDays] days of [today], soonest first. A rule set for 29 Feb is
+ * skipped in non-leap years rather than rolled onto 1 Mar.
+ */
+export function upcomingFestiveBonuses(rules, today, withinDays = 7) {
+  const year = today.getUTCFullYear();
+  const out = [];
+  for (const rule of rules) {
+    if (rule.type !== 'festive' || rule.active === false) continue;
+    if (!rule.triggerMonth || !rule.triggerDay) continue;
+    for (const y of [year, year + 1]) {
+      const date = new Date(Date.UTC(y, rule.triggerMonth - 1, rule.triggerDay));
+      if (date.getUTCMonth() !== rule.triggerMonth - 1) continue; // 29 Feb etc.
+      const daysUntil = daysBetween(today, date);
+      if (daysUntil < 0) continue;
+      if (daysUntil <= withinDays) out.push({ rule, daysUntil });
+      break;
+    }
+  }
+  return out.sort((a, b) => a.daysUntil - b.daysUntil);
 }
 
 /** Top 4 fertilizers by ratio of quantityOnHand / lowStockThreshold. */

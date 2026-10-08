@@ -7,6 +7,10 @@ import {
   currentDiagnosisProvider,
 } from '../../services/diagnosis.service.js';
 import { env } from '../../config/env.js';
+import {
+  aiScansThisMonth,
+  getEntitlements,
+} from '../../services/subscription.service.js';
 
 const scanSchema = z.object({
   imageBase64: z.string().min(64),
@@ -53,17 +57,38 @@ export async function createScan(req, res, next) {
       });
     }
 
+    // Free plan: 10 AI scans a month. Checked before calling the AI, so a
+    // refused scan costs nothing.
+    const { entitlements } = await getEntitlements(req.user.sub);
+    const limit = entitlements.aiScansPerMonth;
+    if (limit != null && (await aiScansThisMonth(p._id)) >= limit) {
+      return res.status(403).json({
+        error: 'scan_limit',
+        message:
+          `You've used all ${limit} free AI scans this month. Upgrade to ` +
+          'Pro for unlimited scans, or scan again from the 1st of next month.',
+      });
+    }
+
+    // Brief §6.1: quantities sized to the planter's acreage — the plot's
+    // when one was picked, otherwise the whole estate.
+    let areaAcres = p.totalAcres ?? null;
+    let areaLabel = 'the whole estate';
     if (body.plotId) {
       const plot = await Plot.findOne({
         _id: body.plotId,
         plantationId: p._id,
       });
       if (!plot) return res.status(404).json({ error: 'plot_not_found' });
+      areaAcres = plot.acres;
+      areaLabel = `plot "${plot.name}"`;
     }
 
     const result = await diagnose({
       imageBase64: body.imageBase64,
       mime: body.imageMime,
+      areaAcres,
+      areaLabel,
     });
 
     const doc = await DiagnosisScan.create({
@@ -82,6 +107,7 @@ export async function createScan(req, res, next) {
       alternatives: result.alternatives,
       treatment: result.treatment,
       advice: result.advice,
+      areaAcres: result.areaAcres ?? null,
       latencyMs: result.latencyMs,
     });
 

@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { AnnualConfig } from '../src/models/AnnualConfig.js';
 import {
   computeSettlement,
+  isSettlementYearOver,
   loadConfigForYear,
+  settlementTotals,
   settlementYearRange,
 } from '../src/services/settlement.service.js';
 
@@ -175,4 +177,27 @@ test('more festival days paid weekly than the entitlement → no negative top-up
     periods: FY_2025_PERIODS,
   });
   assert.equal(s.components.festivalPayPaise, 0);
+});
+
+// ---------- finalise (lock) helpers ----------
+
+test('a settlement year can be finalised only after its last day', () => {
+  // Calendar year.
+  assert.equal(isSettlementYearOver(2026, day('2026-12-31'), 1), false);
+  assert.equal(isSettlementYearOver(2026, day('2027-01-01'), 1), true);
+  // Financial year Apr 2025 – Mar 2026.
+  assert.equal(isSettlementYearOver(2025, day('2026-03-31'), 4), false);
+  assert.equal(isSettlementYearOver(2025, day('2026-04-01'), 4), true);
+});
+
+test('settlementTotals rolls up bonus pool, settlement and grand totals', () => {
+  const t = settlementTotals([
+    { components: { bonusPaise: 100 }, settlementTotalPaise: 1000, grandTotalPaise: 5000 },
+    { components: { bonusPaise: 50 }, settlementTotalPaise: 500, grandTotalPaise: 2500 },
+  ]);
+  assert.deepEqual(t, {
+    bonusPoolPaise: 150,
+    settlementTotalPaise: 1500,
+    grandTotalPaise: 7500,
+  });
 });

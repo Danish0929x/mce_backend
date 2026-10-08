@@ -1,5 +1,8 @@
 import { User } from '../models/User.js';
+import { Plantation } from '../models/Plantation.js';
 import { Subscription } from '../models/Subscription.js';
+import { DiagnosisScan } from '../models/DiagnosisScan.js';
+import { istInstantRange, todayIST } from '../utils/dates.js';
 import { verifyAppStore, verifyGooglePlay } from './store-verification.service.js';
 
 /**
@@ -7,14 +10,16 @@ import { verifyAppStore, verifyGooglePlay } from './store-verification.service.j
  *
  *   pro       — store-verified subscription that has not expired
  *   pro_trial — 30-day trial from signup (User.trialEndsAt)
- *   free      — everything else: max 5 active workers, no PDF exports,
- *               no bulk CSV import
+ *   free      — everything else: max 5 active workers, 10 AI scans a
+ *               month, no PDF exports, no bulk CSV import
  *
  * The plan is always derived from dates at request time, so a trial or a
  * lapsed subscription downgrades without any background job.
  */
 
 export const FREE_WORKER_LIMIT = 5;
+/** AI crop scans per calendar month (IST) on the free plan. */
+export const FREE_AI_SCANS_PER_MONTH = 10;
 /** Pro is a single yearly plan — ₹4,200/year (brief §5.5.3). */
 export const PRODUCT_IDS = ['mce_pro_yearly'];
 
@@ -32,6 +37,7 @@ export function entitlementsFor(plan) {
   return {
     isPro: pro,
     workerLimit: pro ? null : FREE_WORKER_LIMIT,
+    aiScansPerMonth: pro ? null : FREE_AI_SCANS_PER_MONTH,
     canExportPdf: pro,
     canBulkImport: pro,
   };
@@ -84,9 +90,25 @@ export async function getEntitlements(userId) {
   return { user, sub, plan, entitlements: entitlementsFor(plan) };
 }
 
+/** AI scans this estate has run since the 1st of the current IST month. */
+export async function aiScansThisMonth(plantationId) {
+  const today = todayIST();
+  const monthStart = new Date(
+    Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1),
+  );
+  return DiagnosisScan.countDocuments({
+    plantationId,
+    createdAt: istInstantRange(monthStart, today),
+  });
+}
+
 /** Response shape for GET /subscriptions/status. */
 export async function getSubscriptionStatus(userId) {
   const { user, sub, plan, entitlements } = await getEntitlements(userId);
+  const plantation = await Plantation.findOne({ ownerId: userId }).select('_id');
+  const aiScansUsedThisMonth = plantation
+    ? await aiScansThisMonth(plantation._id)
+    : 0;
   const expiresAt =
     plan === 'pro'
       ? new Date(sub.expiresDateMs)
@@ -100,6 +122,7 @@ export async function getSubscriptionStatus(userId) {
     trialEndsAt: user.trialEndsAt ?? null,
     productId: plan === 'pro' ? sub.productId : null,
     entitlements,
+    aiScansUsedThisMonth,
   };
 }
 

@@ -29,7 +29,7 @@ const devProvider = {
     devStore.set(phoneE164, { code, expiresAt });
     // eslint-disable-next-line no-console
     console.log(
-      `\x1b[33m[otp:dev]\x1b[0m generated for ${phoneE164}: \x1b[1m${code}\x1b[0m  (expires in ${env.otp.ttlSeconds}s)`,
+      `\x1b[33m[otp:dev]\x1b[0m generated for ••••${phoneE164.slice(-4)}: \x1b[1m${code}\x1b[0m  (expires in ${env.otp.ttlSeconds}s)`,
     );
     return { status: 'pending' };
   },
@@ -107,9 +107,8 @@ export async function sendOtp(phoneE164) {
   }
   if (isTestPhone(phoneE164)) {
     // eslint-disable-next-line no-console
-    console.log(
-      `\x1b[36m[otp:test]\x1b[0m bypass — accept TEST_OTP for ${phoneE164}`,
-    );
+    // No phone number in logs (brief §10.3: no PII in logs).
+    console.log('\x1b[36m[otp:test]\x1b[0m bypass — accept TEST_OTP');
     return { status: 'pending' };
   }
   return provider.sendCode(phoneE164);

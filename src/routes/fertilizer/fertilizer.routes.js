@@ -9,6 +9,8 @@ import {
   skipScheduleEntry,
   adjustFertilizerInventory,
   updateFertilizerThreshold,
+  seasonCost,
+  createCustomFertilizer,
 } from '../../controllers/fertilizer/fertilizer.controller.js';
 
 const router = Router();
@@ -17,6 +19,12 @@ router.use(requireAuth);
 
 // Composite read used by the Fertilizer Schedule screen (3 tabs).
 router.get('/', fertilizerOverview);
+
+// Season cost summary card (Inventory tab, brief §5.3.3).
+router.get('/season-cost', seasonCost);
+
+// Custom fertilizers (plantation-scoped, brief §4.3).
+router.post('/fertilizers', createCustomFertilizer);
 
 // Schedule CRUD (full control).
 router.post('/schedule', createScheduleEntry);

@@ -11,8 +11,10 @@ import {
   listWagePeriods,
   createWagePeriod,
   updateWagePeriod,
+  deleteWagePeriod,
   listFestivals,
   createFestival,
+  updateFestival,
   deleteFestival,
   markPayrollPaid,
   listBonuses,
@@ -21,6 +23,7 @@ import {
   logOneOffBonus,
   deleteBonusPayment,
   getYearEndSettlement,
+  finalizeYearEndSettlement,
   getGratuityTracker,
 } from '../../controllers/labor/labor.controller.js';
 
@@ -45,10 +48,12 @@ router.post('/payroll/mark-paid', markPayrollPaid);
 router.get('/wage-periods', listWagePeriods);
 router.post('/wage-periods', createWagePeriod);
 router.patch('/wage-periods/:id', updateWagePeriod);
+router.delete('/wage-periods/:id', deleteWagePeriod);
 
 // Festival calendar
 router.get('/festivals', listFestivals);
 router.post('/festivals', createFestival);
+router.patch('/festivals/:id', updateFestival);
 router.delete('/festivals/:id', deleteFestival);
 
 // Bonus management
@@ -60,6 +65,7 @@ router.delete('/bonuses/payments/:id', deleteBonusPayment);
 
 // Year-end settlement + gratuity
 router.get('/settlement', getYearEndSettlement);
+router.post('/settlement/finalize', finalizeYearEndSettlement);
 router.get('/gratuity', getGratuityTracker);
 
 export default router;

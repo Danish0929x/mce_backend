@@ -27,6 +27,7 @@ test('purge covers every model that stores estate data', () => {
     'SupplyLog',
     'WagePeriod',
     'Worker',
+    'YearEndSettlement',
   ]);
 });
 

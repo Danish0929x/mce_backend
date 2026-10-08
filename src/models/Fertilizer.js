@@ -29,8 +29,12 @@ const fertilizerSchema = new Schema(
     defaultPerAcreKg: { type: Number, default: null },
     /** Short description shown on the row (e.g. "46% N, ammonia-based"). */
     description: { type: String, default: '' },
-    /** Stable string key — used for upsert-by-key during seeding. */
-    systemKey: { type: String, default: null, unique: true, sparse: true },
+    /**
+     * Stable string key — used for upsert-by-key during seeding. No default:
+     * custom fertilizers must leave it absent (not null), or the sparse
+     * unique index would reject the second one.
+     */
+    systemKey: { type: String, unique: true, sparse: true },
   },
   { timestamps: true },
 );

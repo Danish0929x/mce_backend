@@ -10,6 +10,7 @@ import { AnnualConfig } from '../../models/AnnualConfig.js';
 import { PayrollWeek } from '../../models/PayrollWeek.js';
 import { BonusRule } from '../../models/BonusRule.js';
 import { BonusPayment } from '../../models/BonusPayment.js';
+import { YearEndSettlement } from '../../models/YearEndSettlement.js';
 import { rupeesToPaise } from '../../utils/money.js';
 import {
   addDays,
@@ -26,12 +27,17 @@ import {
 import {
   calculateWeeklyPayroll,
   tempRateOn,
+  tenureYearsAt,
   weightagePaise,
 } from '../../services/wage-engine.service.js';
 import {
   calculateYearEndSettlement,
+  isSettlementYearOver,
+  settlementTotals,
   settlementYearRange,
 } from '../../services/settlement.service.js';
+import { materializeDueRuleBonuses } from '../../services/bonus-rules.service.js';
+import { fixedHolidaysFor } from '../../services/festival-calendar.service.js';
 import { getEntitlements } from '../../services/subscription.service.js';
 
 // ---------- helpers ----------
@@ -129,9 +135,31 @@ export async function listWorkers(req, res, next) {
   try {
     const p = await getCallerPlantation(req);
     if (!p) return res.status(404).json({ error: 'no_plantation' });
-    const workers = await Worker.find({ plantationId: p._id, active: true })
-      .sort({ createdAt: 1 });
-    res.json({ ok: true, workers: workers.map((w) => w.toPublicJSON()) });
+    const today = todayIST();
+    await WagePeriod.ensureCoversToday(p._id, today);
+    const [workers, period] = await Promise.all([
+      Worker.find({ plantationId: p._id, active: true }).sort({ createdAt: 1 }),
+      WagePeriod.activeOn(p._id, today),
+    ]);
+    res.json({
+      ok: true,
+      workers: workers.map((w) => {
+        const json = w.toPublicJSON();
+        if (w.type !== 'union') return json;
+        // Today's Basic + DA + weightage (brief §5.4.1); null when no CGA
+        // circular covers today.
+        const weightage = period
+          ? weightagePaise(tenureYearsAt(w.joinedAt, today))
+          : null;
+        return {
+          ...json,
+          weightagePaise: weightage,
+          currentDailyWagePaise: period
+            ? period.basicPaise + period.daPaise + weightage
+            : null,
+        };
+      }),
+    });
   } catch (err) {
     next(err);
   }
@@ -217,6 +245,30 @@ const bulkImportRowSchema = z.object({
   tempRateRupees: z.coerce.number().positive().optional(),
 });
 
+/**
+ * Column names accepted by the CSV import: the brief's snake_case template
+ * (full_name, phone, type, pay_type, rate_inr, joined_at) and the app's
+ * original camelCase headers. Matched case-insensitively.
+ */
+const CSV_HEADER_ALIASES = {
+  full_name: 'fullName',
+  fullname: 'fullName',
+  name: 'fullName',
+  phone: 'phone',
+  type: 'type',
+  pay_type: 'tempPayType',
+  temppaytype: 'tempPayType',
+  rate_inr: 'tempRateRupees',
+  tempraterupees: 'tempRateRupees',
+  joined_at: 'joinedAt',
+  joinedat: 'joinedAt',
+};
+
+function csvHeaderKey(header) {
+  const h = String(header).trim();
+  return CSV_HEADER_ALIASES[h.toLowerCase()] ?? h;
+}
+
 /** Normalize a phone into E.164 (+91XXXXXXXXXX) or return null. */
 function normalizePhone(raw) {
   if (raw == null) return null;
@@ -244,7 +296,7 @@ export async function bulkImportWorkers(req, res, next) {
     let rawRows;
     try {
       rawRows = parseCsv(csv, {
-        columns: (headers) => headers.map((h) => h.trim()),
+        columns: (headers) => headers.map(csvHeaderKey),
         skip_empty_lines: true,
         trim: true,
         bom: true,
@@ -312,7 +364,7 @@ export async function bulkImportWorkers(req, res, next) {
         if (!b.tempPayType || b.tempRateRupees == null) {
           skipped.push({
             row: rowNumber,
-            reason: 'Temp workers require tempPayType and tempRateRupees.',
+            reason: 'Temp workers require pay_type and rate_inr.',
           });
           continue;
         }
@@ -533,6 +585,8 @@ export async function getWeeklyPayroll(req, res, next) {
     if (!p) return res.status(404).json({ error: 'no_plantation' });
 
     const today = todayIST();
+    await WagePeriod.ensureCoversToday(p._id, today);
+    await materializeDueRuleBonuses(p._id, today);
     const weekStart = startOfWeekMonday(queryDateOr(req.query.start, today));
     const weekEnd = endOfDay(addDays(weekStart, 6));
 
@@ -813,10 +867,11 @@ export async function listWagePeriods(req, res, next) {
   try {
     const p = await getCallerPlantation(req);
     if (!p) return res.status(404).json({ error: 'no_plantation' });
+    const today = todayIST();
+    await WagePeriod.ensureCoversToday(p._id, today);
     const periods = await WagePeriod.find({ plantationId: p._id }).sort({
       effectiveFrom: 1,
     });
-    const today = todayIST();
     res.json({
       ok: true,
       periods: periods.map((p) => ({
@@ -906,6 +961,27 @@ export async function listFestivals(req, res, next) {
     const start = new Date(Date.UTC(year, 0, 1));
     const end = new Date(Date.UTC(year, 11, 31, 23, 59, 59));
 
+    // A year with nothing marked yet starts with the fixed-date holidays
+    // still ahead; the planter adds the lunar festivals.
+    const marked = await FestivalDate.countDocuments({
+      plantationId: p._id,
+      date: { $gte: start, $lte: end },
+    });
+    if (marked === 0) {
+      const defaults = fixedHolidaysFor(year, todayIST());
+      if (defaults.length) {
+        try {
+          await FestivalDate.insertMany(
+            defaults.map((h) => ({ plantationId: p._id, ...h })),
+            { ordered: false },
+          );
+        } catch (err) {
+          // A concurrent request preloaded them first.
+          if (err?.code !== 11000) throw err;
+        }
+      }
+    }
+
     const [festivals, cfg] = await Promise.all([
       FestivalDate.find({
         plantationId: p._id,
@@ -977,6 +1053,29 @@ export async function createFestival(req, res, next) {
   }
 }
 
+const festivalUpdateSchema = z.object({
+  label: z.string().trim().min(1).max(80),
+});
+
+/** PATCH /labor/festivals/:id — rename a festival day. */
+export async function updateFestival(req, res, next) {
+  try {
+    const body = festivalUpdateSchema.parse(req.body);
+    const p = await getCallerPlantation(req);
+    if (!p) return res.status(404).json({ error: 'no_plantation' });
+
+    const doc = await FestivalDate.findOneAndUpdate(
+      { _id: req.params.id, plantationId: p._id },
+      { $set: { label: body.label } },
+      { new: true },
+    );
+    if (!doc) return res.status(404).json({ error: 'festival_not_found' });
+    res.json({ ok: true, festival: doc.toPublicJSON() });
+  } catch (err) {
+    next(toHttpError(err));
+  }
+}
+
 /** DELETE /labor/festivals/:id — unmark a festival day. */
 export async function deleteFestival(req, res, next) {
   try {
@@ -1000,9 +1099,45 @@ export async function deleteFestival(req, res, next) {
 // YEAR-END SETTLEMENT
 // ============================================================
 
+/** Live settlement rows for [year]'s union workers (not yet finalised). */
+async function liveSettlementRows(plantationId, year) {
+  const { yearStart, yearEnd } = settlementYearRange(year);
+  // Union workers only (CGA rules), including anyone deactivated during
+  // the year who still worked or was paid in it.
+  const workers = await workersForRange(plantationId, yearStart, yearEnd, {
+    type: 'union',
+  });
+  const rows = [];
+  for (const w of workers) {
+    const s = await calculateYearEndSettlement({ worker: w, year });
+    rows.push({ worker: w.toPublicJSON(), ...s });
+  }
+  return rows;
+}
+
+function finalizedRows(plantationId, year) {
+  return YearEndSettlement.find({ plantationId, year }).sort({ createdAt: 1, _id: 1 });
+}
+
+function settlementResponse(year, breakdowns, finalizedAt) {
+  return {
+    ok: true,
+    year,
+    // Last day of the settlement year, and whether it can be finalised now.
+    yearEnd: settlementYearRange(year).yearEnd,
+    canFinalize:
+      !finalizedAt && breakdowns.length > 0 && isSettlementYearOver(year, todayIST()),
+    finalizedAt,
+    totals: settlementTotals(breakdowns),
+    breakdowns,
+  };
+}
+
 /**
- * GET /labor/settlement?year=YYYY — settlement for every active union
- * worker plus a roll-up of bonus pool and grand total.
+ * GET /labor/settlement?year=YYYY — settlement for every union worker plus
+ * a roll-up of bonus pool and grand total. A finalised year returns the
+ * locked figures (`finalizedAt` set); otherwise a live preview
+ * (`finalizedAt: null`).
  */
 export async function getYearEndSettlement(req, res, next) {
   try {
@@ -1010,48 +1145,97 @@ export async function getYearEndSettlement(req, res, next) {
     if (!p) return res.status(404).json({ error: 'no_plantation' });
 
     const year = Number(req.query.year) || currentYearIST();
-    const { yearStart, yearEnd } = settlementYearRange(year);
+    const locked = await finalizedRows(p._id, year);
+    if (locked.length) {
+      return res.json(
+        settlementResponse(
+          year,
+          locked.map((d) => d.toPublicJSON()),
+          locked[0].finalizedAt,
+        ),
+      );
+    }
+    const rows = await liveSettlementRows(p._id, year);
+    res.json(settlementResponse(year, rows, null));
+  } catch (err) {
+    next(err);
+  }
+}
 
-    // Union workers only (CGA rules), including anyone deactivated during
-    // the year who still worked or was paid in it.
-    const workers = await workersForRange(p._id, yearStart, yearEnd, {
-      type: 'union',
-    });
+const finalizeSettlementSchema = z.object({
+  year: z.number().int().min(2000).max(2100),
+});
 
-    const breakdowns = [];
-    for (const w of workers) {
-      const s = await calculateYearEndSettlement({ worker: w, year });
-      breakdowns.push({
-        worker: w.toPublicJSON(),
-        ...s,
+/**
+ * POST /labor/settlement/finalize { year } — compute and lock [year]'s
+ * settlement (brief §5.4.7: "Generated once per year and locked"). Only
+ * after the settlement year has ended. Idempotent: a finalised year returns
+ * its stored figures unchanged.
+ */
+export async function finalizeYearEndSettlement(req, res, next) {
+  try {
+    const { year } = finalizeSettlementSchema.parse(req.body);
+    const p = await getCallerPlantation(req);
+    if (!p) return res.status(404).json({ error: 'no_plantation' });
+
+    const existing = await finalizedRows(p._id, year);
+    if (existing.length) {
+      return res.json({
+        ...settlementResponse(
+          year,
+          existing.map((d) => d.toPublicJSON()),
+          existing[0].finalizedAt,
+        ),
+        alreadyFinalized: true,
       });
     }
 
-    const bonusPoolPaise = breakdowns.reduce(
-      (s, b) => s + (b.components?.bonusPaise ?? 0),
-      0,
-    );
-    const settlementTotalPaise = breakdowns.reduce(
-      (s, b) => s + (b.settlementTotalPaise ?? 0),
-      0,
-    );
-    const grandTotalPaise = breakdowns.reduce(
-      (s, b) => s + (b.grandTotalPaise ?? 0),
-      0,
-    );
+    if (!isSettlementYearOver(year, todayIST())) {
+      const { yearEnd } = settlementYearRange(year);
+      return res.status(409).json({
+        error: 'year_not_ended',
+        message:
+          `The ${year} settlement year runs until ` +
+          `${yearEnd.toISOString().slice(0, 10)}. It can be finalised once ` +
+          'the year has ended.',
+      });
+    }
 
-    res.json({
-      ok: true,
-      year,
-      totals: {
-        bonusPoolPaise,
-        settlementTotalPaise,
-        grandTotalPaise,
-      },
-      breakdowns,
-    });
+    const rows = await liveSettlementRows(p._id, year);
+    if (!rows.length) {
+      return res.status(400).json({
+        error: 'no_workers',
+        message: `There are no union workers to settle for ${year}.`,
+      });
+    }
+
+    const finalizedAt = new Date();
+    try {
+      await YearEndSettlement.insertMany(
+        rows.map((r) => ({
+          ...r,
+          plantationId: p._id,
+          workerId: r.workerId,
+          finalizedAt,
+          finalizedBy: req.user.sub,
+        })),
+        { ordered: false },
+      );
+    } catch (err) {
+      // A concurrent finalise stored some rows first — keep theirs.
+      if (err?.code !== 11000) throw err;
+    }
+
+    const locked = await finalizedRows(p._id, year);
+    res.status(201).json(
+      settlementResponse(
+        year,
+        locked.map((d) => d.toPublicJSON()),
+        locked[0]?.finalizedAt ?? finalizedAt,
+      ),
+    );
   } catch (err) {
-    next(err);
+    next(toHttpError(err));
   }
 }
 
@@ -1069,6 +1253,7 @@ export async function getGratuityTracker(req, res, next) {
   try {
     const p = await getCallerPlantation(req);
     if (!p) return res.status(404).json({ error: 'no_plantation' });
+    await WagePeriod.ensureCoversToday(p._id, todayIST());
 
     const workers = await Worker.find({
       plantationId: p._id,
@@ -1124,6 +1309,7 @@ export async function listBonuses(req, res, next) {
     const p = await getCallerPlantation(req);
     if (!p) return res.status(404).json({ error: 'no_plantation' });
 
+    await materializeDueRuleBonuses(p._id, todayIST());
     const [rules, payments, workers] = await Promise.all([
       BonusRule.find({ plantationId: p._id, active: true }).sort({ createdAt: 1 }),
       BonusPayment.find({ plantationId: p._id })
@@ -1304,6 +1490,14 @@ export async function deleteBonusPayment(req, res, next) {
     if (await paidWeekContaining(payment.workerId, istDateOnly(payment.paidAt))) {
       return weekPaidResponse(res, 'bonuses');
     }
+    // A rule payment the planter removes must not be paid again by the
+    // lazy rule payout.
+    if (payment.ruleId && payment.occurrenceKey) {
+      await BonusRule.updateOne(
+        { _id: payment.ruleId, plantationId: p._id },
+        { $addToSet: { skippedOccurrenceKeys: payment.occurrenceKey } },
+      );
+    }
     await payment.deleteOne();
     res.json({ ok: true });
   } catch (err) {
@@ -1431,10 +1625,48 @@ export async function updateWagePeriod(req, res, next) {
     doc.basicPaise = basicPaise;
     doc.daPaise = daPaise;
     doc.totalPaise = basicPaise + daPaise;
+    // The planter has now checked this quarter's rates.
+    doc.carriedForwardFrom = null;
 
     await doc.save();
     res.json({ ok: true, period: doc.toPublicJSON() });
   } catch (err) {
     next(toHttpError(err));
+  }
+}
+
+/**
+ * DELETE /labor/wage-periods/:id — remove a circular entered by mistake.
+ * Refused once any paid union payroll week overlaps it: those weeks were
+ * paid at its rates. Union pay for its dates is ₹0 until another circular
+ * covers them (a period covering today is recreated by ensureCoversToday
+ * with the latest carried-forward rates).
+ */
+export async function deleteWagePeriod(req, res, next) {
+  try {
+    const p = await getCallerPlantation(req);
+    if (!p) return res.status(404).json({ error: 'no_plantation' });
+    const doc = await WagePeriod.findOne({ _id: req.params.id, plantationId: p._id });
+    if (!doc) return res.status(404).json({ error: 'period_not_found' });
+
+    const paidWeekCount = await countPaidUnionWeeks(
+      p._id,
+      doc.effectiveFrom,
+      doc.effectiveTo,
+    );
+    if (paidWeekCount > 0) {
+      return res.status(409).json({
+        error: 'period_has_paid_payroll',
+        paidWeekCount,
+        message:
+          `${paidWeekCount} paid payroll week(s) used the rates of "${doc.label}", ` +
+          "so it can't be deleted. Edit it instead, or contact support.",
+      });
+    }
+
+    await doc.deleteOne();
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
   }
 }

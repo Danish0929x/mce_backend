@@ -34,6 +34,11 @@ const bonusRuleSchema = new Schema(
     /** 'union' | 'temp' | 'all' */
     appliesTo: { type: String, default: 'union', enum: ['union', 'temp', 'all'] },
     active: { type: Boolean, default: true },
+    /**
+     * Occurrence keys of rule payments the planter deleted, so the lazy
+     * payout (bonus-rules.service) doesn't create them again.
+     */
+    skippedOccurrenceKeys: { type: [String], default: [] },
   },
   { timestamps: true },
 );

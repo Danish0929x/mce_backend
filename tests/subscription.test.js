@@ -30,10 +30,11 @@ test('expired or revoked subscription → free', () => {
   assert.equal(effectivePlan(user, { isActive: false, expiresDateMs: NOW + DAY }, NOW), 'free');
 });
 
-test('free plan: 5 workers, no PDF, no CSV; trial and pro unlock all', () => {
+test('free plan: 5 workers, 10 AI scans/month, no PDF, no CSV; trial and pro unlock all', () => {
   assert.deepEqual(entitlementsFor('free'), {
     isPro: false,
     workerLimit: FREE_WORKER_LIMIT,
+    aiScansPerMonth: 10,
     canExportPdf: false,
     canBulkImport: false,
   });
@@ -42,6 +43,7 @@ test('free plan: 5 workers, no PDF, no CSV; trial and pro unlock all', () => {
     assert.deepEqual(entitlementsFor(plan), {
       isPro: true,
       workerLimit: null,
+      aiScansPerMonth: null,
       canExportPdf: true,
       canBulkImport: true,
     });

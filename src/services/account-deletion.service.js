@@ -19,6 +19,7 @@ import '../models/Supply.js';
 import '../models/SupplyLog.js';
 import '../models/WagePeriod.js';
 import '../models/Worker.js';
+import '../models/YearEndSettlement.js';
 
 /**
  * Account deletion — brief §10.4 (DPDP Act): 30-day soft delete, then a
