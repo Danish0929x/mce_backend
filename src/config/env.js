@@ -56,6 +56,18 @@ export const env = {
      * with their own real number. NEVER enable in production.
      */
     acceptAnyPhone: optional('TEST_ACCEPT_ANY_PHONE', 'false') === 'true',
+    /**
+     * Return the generated OTP in the login response so the app can show it
+     * on screen. On by default outside production; this flag turns it on in
+     * a production-mode deployment too, which is what a TestFlight or
+     * internal build needs when there is no SMS provider and no separate
+     * staging server.
+     *
+     * It only applies to the 'dev' OTP provider — there is no Twilio code
+     * for us to reveal. MUST be off before the app is public: it hands
+     * anyone who can call the API a working code for any phone number.
+     */
+    revealCode: optional('OTP_REVEAL_CODE', 'false') === 'true',
   },
 
   twilio: {
@@ -103,6 +115,14 @@ if (env.otp.provider === 'twilio') {
       );
     }
   }
+}
+
+if (env.otp.revealCode && env.nodeEnv === 'production') {
+  console.warn(
+    '\x1b[41m\x1b[37m[env] OTP_REVEAL_CODE=true in production\x1b[0m — sign-in ' +
+      'codes are returned in the API response. This is for internal and ' +
+      'TestFlight builds only. Turn it off before the app is public.',
+  );
 }
 
 if (env.diagnosis.provider === 'claude' && !env.weather.apiKey) {

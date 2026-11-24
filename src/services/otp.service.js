@@ -104,17 +104,22 @@ const provider = env.otp.provider === 'twilio' ? twilioProvider : devProvider;
 /**
  * May the OTP be returned in the HTTP response?
  *
- * Only when **both** hold:
- *   - the dev provider is active (no real SMS is being sent anyway), and
- *   - NODE_ENV is not 'production'.
+ * Returning a one-time code over the channel that asks for it defeats the
+ * point of having one, so this is deliberately narrow:
  *
- * Returning a one-time code over the same channel that asks for it defeats
- * the point of having one, so this must never be true on a deployed server.
- * Two independent conditions rather than one, so flipping a single env var
- * by accident cannot expose it.
+ *   - The dev provider must be active. With Twilio we do not know the code,
+ *     and with a real SMS channel there is no reason to leak it.
+ *   - AND either we are not in production, or someone has explicitly set
+ *     OTP_REVEAL_CODE=true.
+ *
+ * That second clause exists because TestFlight and internal builds run
+ * against the production server — there is no separate staging deployment —
+ * and testers still have to sign in. It is a conscious, single-purpose
+ * switch that announces itself loudly at boot, not a weakening of the rule.
  */
 function mayRevealCode() {
-  return env.otp.provider === 'dev' && isDev;
+  if (env.otp.provider !== 'dev') return false;
+  return isDev || env.otp.revealCode;
 }
 
 export async function sendOtp(phoneE164) {
