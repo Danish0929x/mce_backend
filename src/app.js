@@ -7,6 +7,7 @@ import { notFound, errorHandler } from './middleware/error.js';
 import authRoutes from './routes/auth/auth.routes.js';
 import dashboardRoutes from './routes/dashboard/dashboard.routes.js';
 import diagnosisRoutes from './routes/diagnosis/diagnosis.routes.js';
+import adminRoutes from './routes/admin/admin.routes.js';
 import fertilizerRoutes from './routes/fertilizer/fertilizer.routes.js';
 import healthRoutes from './routes/health.routes.js';
 import inventoryRoutes from './routes/inventory/inventory.routes.js';
@@ -33,6 +34,7 @@ export function createApp() {
   app.use('/api/v1/inventory', inventoryRoutes);
   app.use('/api/v1/labor', laborRoutes);
   app.use('/api/v1/diagnosis', diagnosisRoutes);
+  app.use('/api/v1/admin', adminRoutes);
   app.use('/api/v1/subscriptions', subscriptionRoutes);
 
   app.use(notFound);

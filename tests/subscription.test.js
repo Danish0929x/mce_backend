@@ -30,13 +30,14 @@ test('expired or revoked subscription → free', () => {
   assert.equal(effectivePlan(user, { isActive: false, expiresDateMs: NOW + DAY }, NOW), 'free');
 });
 
-test('free plan: 5 workers, 10 AI scans/month, no PDF, no CSV; trial and pro unlock all', () => {
+test('free plan: 5 workers, 5 AI scans/month, 1 photo, no PDF, no CSV; trial and pro unlock all', () => {
   assert.deepEqual(entitlementsFor('free'), {
     isPro: false,
     workerLimit: FREE_WORKER_LIMIT,
-    aiScansPerMonth: 10,
+    aiScansPerMonth: 5,
     canExportPdf: false,
     canBulkImport: false,
+    photosPerScan: 1,
   });
   assert.equal(FREE_WORKER_LIMIT, 5);
   for (const plan of ['pro', 'pro_trial']) {
@@ -46,6 +47,7 @@ test('free plan: 5 workers, 10 AI scans/month, no PDF, no CSV; trial and pro unl
       aiScansPerMonth: null,
       canExportPdf: true,
       canBulkImport: true,
+      photosPerScan: 3,
     });
   }
 });

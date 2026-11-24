@@ -78,6 +78,13 @@ export const env = {
     maxImageBytes: Number(optional('DIAGNOSIS_MAX_IMAGE_BYTES', '3145728')),
   },
 
+  weather: {
+    /** OpenWeather key. Absent = weather context silently disabled. */
+    apiKey: optional('OPENWEATHER_API_KEY'),
+    /** How long a district's snapshot is reused before refetching. */
+    cacheTtlMinutes: Number(optional('WEATHER_CACHE_TTL_MINUTES', '360')),
+  },
+
   anthropic: {
     apiKey: optional('ANTHROPIC_API_KEY'),
     /** Override at runtime to swap models (e.g. claude-sonnet-4-6). */
@@ -96,6 +103,13 @@ if (env.otp.provider === 'twilio') {
       );
     }
   }
+}
+
+if (env.diagnosis.provider === 'claude' && !env.weather.apiKey) {
+  console.warn(
+    '[env] OPENWEATHER_API_KEY not set — diagnosis prompts will fall back to ' +
+      'seasonal norms without live weather. Accuracy will be lower.',
+  );
 }
 
 if (env.diagnosis.provider === 'claude' && !env.anthropic.apiKey) {

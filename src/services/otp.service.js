@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import twilio from 'twilio';
-import { env } from '../config/env.js';
+import { env, isDev } from '../config/env.js';
 
 /**
  * Send-and-verify OTP service. Two providers behind one interface so the
@@ -31,7 +31,10 @@ const devProvider = {
     console.log(
       `\x1b[33m[otp:dev]\x1b[0m generated for ••••${phoneE164.slice(-4)}: \x1b[1m${code}\x1b[0m  (expires in ${env.otp.ttlSeconds}s)`,
     );
-    return { status: 'pending' };
+    // Handed back so a dev build can show it on screen — Twilio isn't set up
+    // locally and reading the server console on every sign-in is friction.
+    // sendOtp() decides whether it's safe to expose; see the guard there.
+    return { status: 'pending', devCode: code };
   },
 
   async verifyCode(phoneE164, code) {
@@ -98,6 +101,22 @@ function isTestPhone(phoneE164) {
 
 const provider = env.otp.provider === 'twilio' ? twilioProvider : devProvider;
 
+/**
+ * May the OTP be returned in the HTTP response?
+ *
+ * Only when **both** hold:
+ *   - the dev provider is active (no real SMS is being sent anyway), and
+ *   - NODE_ENV is not 'production'.
+ *
+ * Returning a one-time code over the same channel that asks for it defeats
+ * the point of having one, so this must never be true on a deployed server.
+ * Two independent conditions rather than one, so flipping a single env var
+ * by accident cannot expose it.
+ */
+function mayRevealCode() {
+  return env.otp.provider === 'dev' && isDev;
+}
+
 export async function sendOtp(phoneE164) {
   if (!isValidIndianE164(phoneE164)) {
     const err = new Error('Phone must be in +91XXXXXXXXXX format');
@@ -109,9 +128,18 @@ export async function sendOtp(phoneE164) {
     // eslint-disable-next-line no-console
     // No phone number in logs (brief §10.3: no PII in logs).
     console.log('\x1b[36m[otp:test]\x1b[0m bypass — accept TEST_OTP');
-    return { status: 'pending' };
+    return {
+      status: 'pending',
+      ...(mayRevealCode() ? { devCode: env.otp.testOtp } : {}),
+    };
   }
-  return provider.sendCode(phoneE164);
+  const result = await provider.sendCode(phoneE164);
+  // Strip the code unless this build is allowed to show it.
+  if (!mayRevealCode()) {
+    const { devCode: _dropped, ...safe } = result;
+    return safe;
+  }
+  return result;
 }
 
 export async function verifyOtp(phoneE164, code) {

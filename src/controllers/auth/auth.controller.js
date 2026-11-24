@@ -50,6 +50,8 @@ export async function login(req, res, next) {
       ok: true,
       provider: currentOtpProvider,
       status: result.status,
+      // Present only on a local dev build; sendOtp() strips it otherwise.
+      ...(result.devCode ? { devCode: result.devCode } : {}),
     });
   } catch (err) {
     next(toHttpError(err));
@@ -74,6 +76,7 @@ export async function register(req, res, next) {
       ok: true,
       provider: currentOtpProvider,
       status: result.status,
+      ...(result.devCode ? { devCode: result.devCode } : {}),
     });
   } catch (err) {
     next(toHttpError(err));

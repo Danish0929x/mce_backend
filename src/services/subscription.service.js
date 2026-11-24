@@ -10,7 +10,7 @@ import { verifyAppStore, verifyGooglePlay } from './store-verification.service.j
  *
  *   pro       — store-verified subscription that has not expired
  *   pro_trial — 30-day trial from signup (User.trialEndsAt)
- *   free      — everything else: max 5 active workers, 10 AI scans a
+ *   free      — everything else: max 5 active workers, 5 AI scans a
  *               month, no PDF exports, no bulk CSV import
  *
  * The plan is always derived from dates at request time, so a trial or a
@@ -19,9 +19,12 @@ import { verifyAppStore, verifyGooglePlay } from './store-verification.service.j
 
 export const FREE_WORKER_LIMIT = 5;
 /** AI crop scans per calendar month (IST) on the free plan. */
-export const FREE_AI_SCANS_PER_MONTH = 10;
+export const FREE_AI_SCANS_PER_MONTH = 5;
 /** Pro is a single yearly plan — ₹4,200/year (brief §5.5.3). */
 export const PRODUCT_IDS = ['mce_pro_yearly'];
+/** Photos per AI scan. Pro may send 3 angles of the same problem. */
+export const FREE_PHOTOS_PER_SCAN = 1;
+export const PRO_PHOTOS_PER_SCAN = 3;
 
 /** Effective plan from the user's trial and their latest subscription. */
 export function effectivePlan(user, subscription, now = Date.now()) {
@@ -40,6 +43,7 @@ export function entitlementsFor(plan) {
     aiScansPerMonth: pro ? null : FREE_AI_SCANS_PER_MONTH,
     canExportPdf: pro,
     canBulkImport: pro,
+    photosPerScan: pro ? PRO_PHOTOS_PER_SCAN : FREE_PHOTOS_PER_SCAN,
   };
 }
 
@@ -99,6 +103,10 @@ export async function aiScansThisMonth(plantationId) {
   return DiagnosisScan.countDocuments({
     plantationId,
     createdAt: istInstantRange(monthStart, today),
+    // Refusals ("Not a cardamom plant", "Image unclear") gave the planter no
+    // advice, so they are not billed. `$ne: false` rather than `true` so
+    // scans written before this field existed still count.
+    isDiagnostic: { $ne: false },
   });
 }
 
